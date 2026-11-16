@@ -389,9 +389,11 @@ static int bridge_enumerate(void)
     bridge_request_t req = { CMD_ENUMERATE, 0, 0 };
     bridge_response_t resp = { 0, 0 };
     uint32_t count = 0, i;
-    /* Xgpro/Minipro have four usb_handle/winusb_handle slots; Xgpro_T76 has
-     * one.  Never advertise more than the app can store. */
-    int app_max = (pid == 0x1A86) ? 1 : 4;
+    /* Xgpro/Minipro have exactly four usb_handle/winusb_handle slots and stop
+     * after index 3; a fifth device is never opened (verified with five fakes:
+     * devices_count stayed 4 and usb_handle[4] kept the adjacent GUID).
+     * Xgpro_T76 has one slot.  Never advertise more than the app can store. */
+    int app_max = (pid == 0x1A86) ? 1 : BRIDGE_MAX_DEVICES;
     int n = 0, target;
 
     if (s == INVALID_SOCKET) {

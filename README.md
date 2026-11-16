@@ -75,8 +75,9 @@ XGPRO_DEBUG=1 WINEPREFIX=~/.wine-xgpro WINEDLLOVERRIDES="winusb=n" wine ~/.wine-
 Xgpro supports up to four programmers in one window. The bridge presents every
 programmer the daemon finds and opens one connection per device, so Xgpro's own
 `open_devices` fills `usb_handle[]`, `winusb_handle[]` and `devices_count`
-through its normal code path. No app internals are patched. Xgpro_T76 stays at
-one programmer, matching that app's own limit.
+through its normal code path. No app internals are patched. The shim caps
+enumeration at four (one for Xgpro_T76, matching that app's own limit); a fifth
+device is ignored.
 
 ## Test-only fake devices
 

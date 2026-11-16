@@ -5,7 +5,9 @@
 
 #define BRIDGE_PORT 7372
 #define BRIDGE_PATH_LEN 64
-#define BRIDGE_MAX_DEVICES 8
+/* Xgpro/Minipro have four programmer slots; Xgpro_T76 has one, which
+ * the shim enforces separately. */
+#define BRIDGE_MAX_DEVICES 4
 
 /* Bumped whenever bridge_request_t/bridge_hello_t or the command semantics
  * change. The shim sends CMD_HELLO right after auth; a daemon that rejects it
