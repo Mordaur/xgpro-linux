@@ -618,7 +618,34 @@ static void drain_payload_ep(uint8_t ep)
         fprintf(stderr, "[bridge] drained %d stale bytes from ep 0x%02x\n", total, ep);
 }
 
-static const xgpro_model_t *model_by_pid(uint16_t pid)
+static int ep_present(const uint8_t *eps, int n, uint8_t ep)
+{
+    for (int i = 0; i < n; i++)
+        if (eps[i] == ep)
+            return 1;
+    return 0;
+}
+
+/* Rows are ordered most-specific first for a PID: the II+ (with its 0x83
+ * peer) precedes the T48 and T56, which share PID 0x0A53. */
+static const xgpro_model_t *model_for_device(uint16_t pid, const uint8_t *eps, int n)
+{
+    for (int i = 0; i < XGPRO_MODEL_COUNT; i++) {
+        const xgpro_model_t *m = &XGPRO_MODELS[i];
+        if (m->pid != pid)
+            continue;
+        if (!ep_present(eps, n, m->ep_in) || !ep_present(eps, n, m->ep_out))
+            continue;
+        if (m->ep_in_peer && !ep_present(eps, n, m->ep_in_peer))
+            continue;
+        if (m->ep_out_peer && !ep_present(eps, n, m->ep_out_peer))
+            continue;
+        return m;
+    }
+    return NULL;
+}
+
+static const xgpro_model_t *first_model_for_pid(uint16_t pid)
 {
     for (int i = 0; i < XGPRO_MODEL_COUNT; i++)
         if (XGPRO_MODELS[i].pid == pid)
@@ -626,22 +653,11 @@ static const xgpro_model_t *model_by_pid(uint16_t pid)
     return NULL;
 }
 
-static int model_has_ep(uint8_t ep)
+static int pid_seen(const uint16_t *pids, int n, uint16_t pid)
 {
-    for (int i = 0; i < bulk_ep_count; i++)
-        if (bulk_eps[i] == ep)
+    for (int i = 0; i < n; i++)
+        if (pids[i] == pid)
             return 1;
-    return 0;
-}
-
-static int validate_model_endpoints(const xgpro_model_t *m)
-{
-    if (!m || !model_has_ep(m->ep_in) || !model_has_ep(m->ep_out))
-        return -1;
-    if (m->ep_in_peer && !model_has_ep(m->ep_in_peer))
-        return -1;
-    if (m->ep_out_peer && !model_has_ep(m->ep_out_peer))
-        return -1;
     return 0;
 }
 
@@ -655,37 +671,41 @@ static int open_device_locked(uint16_t requested_pid) {
         return 0;
     }
 
-    const xgpro_model_t *want = NULL;
-    if (requested_pid) {
-        want = model_by_pid(requested_pid);
-        if (!want) {
-            fprintf(stderr, "[bridge] requested PID %04x is not a known model\n",
-                    requested_pid);
-            return -1;
-        }
+    /* Candidate PIDs: the requested one, or every unique PID in the table.
+     * The exact profile is chosen from the descriptor endpoints after the
+     * device is open, because T48/T56/II+ share PID 0x0A53. */
+    uint16_t pids[XGPRO_MODEL_COUNT];
+    int npids = 0;
+    for (int i = 0; i < XGPRO_MODEL_COUNT; i++) {
+        uint16_t p = XGPRO_MODELS[i].pid;
+        if (requested_pid && p != requested_pid)
+            continue;
+        if (!pid_seen(pids, npids, p))
+            pids[npids++] = p;
+    }
+    if (!npids) {
+        fprintf(stderr, "[bridge] requested PID %04x is not a known model\n",
+                requested_pid);
+        return -1;
     }
 
+    uint16_t opened_pid = 0;
     int waited = 0;
 
     for (;;) {
-        for (int i = 0; i < XGPRO_MODEL_COUNT && !dev_handle; i++) {
-            if (want && &XGPRO_MODELS[i] != want)
-                continue;
-            dev_handle = libusb_open_device_with_vid_pid(ctx, XGPRO_VID, XGPRO_MODELS[i].pid);
+        for (int i = 0; i < npids && !dev_handle; i++) {
+            dev_handle = libusb_open_device_with_vid_pid(ctx, XGPRO_VID, pids[i]);
             if (dev_handle) {
-                model = &XGPRO_MODELS[i];
-                model_name = model->name;
+                opened_pid = pids[i];
+                break;
             }
         }
         if (dev_handle) break;
 
         if (waited >= OPEN_RETRY_TIMEOUT_MS) {
             fprintf(stderr, "[bridge] No XGecu programmer found (VID=%04x PIDs:", XGPRO_VID);
-            if (want)
-                fprintf(stderr, " %04x", want->pid);
-            else
-                for (int i = 0; i < XGPRO_MODEL_COUNT; i++)
-                    fprintf(stderr, " %04x", XGPRO_MODELS[i].pid);
+            for (int i = 0; i < npids; i++)
+                fprintf(stderr, " %04x", pids[i]);
             fprintf(stderr, ")\n");
             return -1;
         }
@@ -695,12 +715,12 @@ static int open_device_locked(uint16_t requested_pid) {
         waited += OPEN_RETRY_INTERVAL_MS;
     }
 
+    const xgpro_model_t *prov = first_model_for_pid(opened_pid);
     if (waited > 0) {
         fprintf(stderr, "[bridge] Device came back after %d ms, settling %d ms before use\n",
                 waited, BOOT_SETTLE_MS);
-        usleep((model ? model->settle_ms : BOOT_SETTLE_MS) * 1000);
+        usleep((prov ? prov->settle_ms : BOOT_SETTLE_MS) * 1000);
     }
-    fprintf(stderr, "[bridge] Found %s\n", model_name);
 
     if (libusb_kernel_driver_active(dev_handle, 0) == 1) {
         int dr = libusb_detach_kernel_driver(dev_handle, 0);
@@ -737,28 +757,40 @@ static int open_device_locked(uint16_t requested_pid) {
         return -1;
     }
 
-    if (discover_bulk_endpoints() < 0) {
-        fprintf(stderr, "[bridge] Falling back to TL866 endpoint layout (cannot validate %s)\n",
-                model_name);
+    int discovered = discover_bulk_endpoints();
+    if (discovered < 0) {
+        fprintf(stderr, "[bridge] Falling back to TL866 endpoint layout (cannot select profile)\n");
         bulk_eps[0] = 0x01;
         bulk_eps[1] = 0x81;
         bulk_eps[2] = 0x02;
         bulk_eps[3] = 0x82;
         bulk_ep_count = 4;
-    } else if (validate_model_endpoints(model) < 0) {
-        fprintf(stderr, "[bridge] %s: descriptor endpoints do not match the model "
-                "(in=0x%02x/0x%02x out=0x%02x/0x%02x)\n",
-                model_name, model->ep_in, model->ep_in_peer,
-                model->ep_out, model->ep_out_peer);
-        libusb_release_interface(dev_handle, 0);
-        if (kernel_driver_detached) {
-            libusb_attach_kernel_driver(dev_handle, 0);
-            kernel_driver_detached = 0;
-        }
-        libusb_close(dev_handle);
-        dev_handle = NULL;
-        return -1;
     }
+
+    model = model_for_device(opened_pid, bulk_eps, bulk_ep_count);
+    if (!model) {
+        if (discovered < 0) {
+            model = prov;
+            fprintf(stderr, "[bridge] using first profile for PID %04x (endpoints unknown)\n",
+                    opened_pid);
+        } else {
+            fprintf(stderr, "[bridge] PID %04x: no profile matches endpoints:",
+                    opened_pid);
+            for (int i = 0; i < bulk_ep_count; i++)
+                fprintf(stderr, " 0x%02x", bulk_eps[i]);
+            fprintf(stderr, "\n");
+            libusb_release_interface(dev_handle, 0);
+            if (kernel_driver_detached) {
+                libusb_attach_kernel_driver(dev_handle, 0);
+                kernel_driver_detached = 0;
+            }
+            libusb_close(dev_handle);
+            dev_handle = NULL;
+            return -1;
+        }
+    }
+    model_name = model->name;
+    fprintf(stderr, "[bridge] Found %s (PID %04x)\n", model_name, opened_pid);
 
     /* No SET_INTERFACE / CLEAR_HALT here on purpose. The device is already
      * on alt setting 0 with no halted endpoints, and issuing those requests
@@ -1153,11 +1185,6 @@ int main(int argc, char **argv) {
     sigaction(SIGTERM, &sa, NULL);
     signal(SIGPIPE, SIG_IGN);
 
-    if (generate_token() < 0) {
-        fprintf(stderr, "[bridge] Failed to generate auth token\n");
-        return 1;
-    }
-
     int r = libusb_init(&ctx);
     if (r < 0) {
         fprintf(stderr, "[bridge] libusb_init failed: %s\n", libusb_error_name(r));
@@ -1200,6 +1227,14 @@ int main(int argc, char **argv) {
 
     if (listen(srv_fd, 1) < 0) {
         perror("[bridge] listen");
+        return 1;
+    }
+
+    /* Only after the port is ours: a second instance that fails to bind must
+     * not replace the running daemon's token. */
+    if (generate_token() < 0) {
+        fprintf(stderr, "[bridge] Failed to generate auth token\n");
+        close(srv_fd);
         return 1;
     }
 

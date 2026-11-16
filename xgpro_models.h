@@ -27,6 +27,7 @@ typedef char xgpro_guid_must_be_16_bytes[(sizeof(xgpro_guid_t) == 16) ? 1 : -1];
 
 /* Feature flags. */
 #define XGPRO_F_DRAIN_BEFORE_READ (1u << 0)
+#define XGPRO_F_DUAL_PAYLOAD      (1u << 1)
 
 typedef struct {
     uint16_t     pid;
@@ -62,9 +63,18 @@ typedef struct {
  *   X(pid, name, guid, ep_in, ep_in_peer, ep_out, ep_out_peer,
  *     unused_in_ep, drain_on_opcode, settle_ms, flags)
  */
+/* Order matters: within a PID the daemon picks the first row whose required
+ * endpoints are all present. The II+ (6 endpoints) must come before the T48
+ * (4) and T56 (2) because they share PID 0x0A53; the 0x83 peer is what tells
+ * the II+ apart. */
 #define XGPRO_MODEL_TABLE(X)                                            \
-    X(0x0A53, "T48/T56/TL866II Plus", XGPRO_GUID_T48,                   \
-      0x82, 0x83, 0x02, 0x03, 0x00, 0x00, 1000, 0)                      \
+    X(0x0A53, "TL866II Plus", XGPRO_GUID_T48,                           \
+      0x82, 0x83, 0x02, 0x03, 0x00, 0x00, 1000,                         \
+      XGPRO_F_DUAL_PAYLOAD)                                             \
+    X(0x0A53, "T48", XGPRO_GUID_T48,                                    \
+      0x82, 0x00, 0x02, 0x00, 0x00, 0x00, 1000, 0)                      \
+    X(0x0A53, "T56", XGPRO_GUID_T48,                                    \
+      0x81, 0x00, 0x01, 0x00, 0x00, 0x00, 1000, 0)                      \
     X(0x1A86, "T76", XGPRO_GUID_T76,                                    \
       0x82, 0x00, 0x05, 0x00, 0x83, 0x0D, 1000,                         \
       XGPRO_F_DRAIN_BEFORE_READ)
