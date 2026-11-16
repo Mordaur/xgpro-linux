@@ -5,6 +5,12 @@
 
 #define BRIDGE_PORT 7372
 
+/* Bumped whenever bridge_request_t/bridge_hello_t or the command semantics
+ * change. The shim sends CMD_HELLO right after auth; a daemon that rejects it
+ * (old version, unknown command) reports a clean mismatch instead of
+ * misparsing the next transfer. */
+#define BRIDGE_PROTO_VERSION 2u
+
 enum bridge_cmd {
     CMD_OPEN = 1,
     CMD_CLOSE,
@@ -14,7 +20,14 @@ enum bridge_cmd {
     CMD_FLUSH_PIPE,
     CMD_ABORT_PIPE,
     CMD_SUBSCRIBE,
+    CMD_HELLO,
 };
+
+/* Sent immediately after the auth token, before CMD_OPEN. */
+typedef struct {
+    uint16_t version;   /* BRIDGE_PROTO_VERSION */
+    uint16_t pid;       /* requested programmer PID, 0 = any */
+} bridge_hello_t;
 
 /* Pushed to a subscriber when the programmer genuinely attaches/detaches. */
 typedef struct {
@@ -36,10 +49,9 @@ typedef struct {
 } bridge_response_t;
 #pragma pack(pop)
 
-/* All XGecu programmers share the same vendor ID and differ only by PID. */
+/* All XGecu programmers share the same vendor ID; PIDs, GUIDs and endpoint
+ * layouts live in xgpro_models.h. */
 #define XGPRO_VID      0xA466
-#define XGPRO_PID_T48  0x0A53   /* T48, T56, TL866II Plus */
-#define XGPRO_PID_T76  0x1A86   /* T76 */
 
 /* Bulk endpoint addresses are discovered from the device descriptor, because
  * they are not guaranteed to be identical across programmer models. */

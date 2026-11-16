@@ -94,3 +94,25 @@ The T48, T56, and TL866II Plus all share the same USB VID/PID (a466:0a53) and us
 MIT - do whatever just put my name on it.
 
 made by [Tymbark7372](https://github.com/Tymbark7372)
+
+## Adding a programmer
+
+All family differences live in `xgpro_models.h`: identity (PID/GUID), payload
+endpoints and their peers, the endpoint the firmware never services, the
+command that needs a pre-read drain, the post-enumeration settle time and flags.
+Both the Windows shim and the Linux daemon include that header, so adding a
+programmer is one row plus a rebuild:
+
+```
+make && make install
+```
+
+The shim and daemon speak protocol v2: on connect the shim sends `CMD_HELLO`
+with the protocol version and the PID selected by the app's SetupDi GUID, and
+the daemon opens exactly that PID and validates its descriptor endpoints
+against the model. Rebuild both halves together; a version mismatch is reported
+as a clean error instead of a desynchronised transfer.
+
+Known gap: `WinUsb_ControlTransfer` is not forwarded (Xgpro uses bulk only).
+It now logs the setup packet and returns `ERROR_NOT_SUPPORTED`, so a future
+version that needs control transfers fails visibly rather than mysteriously.

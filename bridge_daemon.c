@@ -12,31 +12,23 @@
 #include <libusb-1.0/libusb.h>
 #include <pthread.h>
 #include "bridge_proto.h"
+#include "xgpro_models.h"
 
 static int verbose = 0;
 
 #define MAX_TRANSFER_LEN (16 * 1024 * 1024)
 #define MAX_BULK_EPS 16
 
-/* Programmers are told apart by PID only; the VID is shared.
- *
- * The families differ in more than identity, and the differences are not
- * cosmetic: the T76 has one payload endpoint and a dead 0x83 that Xgpro still
- * reads from, while the T48 family splits payloads across two endpoints that
- * must be drained together or the firmware wedges. Keep that in one table
- * instead of scattering PID checks. */
-static const struct xgpro_model {
-    uint16_t    pid;
-    const char *name;
-    uint8_t     payload_in;        /* payload read endpoint */
-    uint8_t     payload_in_peer;   /* second half, 0 when single-endpoint */
-    uint8_t     payload_out;       /* payload write endpoint */
-    uint8_t     payload_out_peer;  /* second half, 0 when single-endpoint */
-    uint8_t     unused_in_ep;      /* endpoint the firmware never services */
-    int         settle_ms;         /* wait after re-enumeration */
-} XGPRO_MODELS[] = {
-    { XGPRO_PID_T48, "T48/T56/TL866II Plus", 0x82, 0x83, 0x02, 0x03, 0x00, 1000 },
-    { XGPRO_PID_T76, "T76",                  0x82, 0x00, 0x05, 0x00, 0x83, 1000 },
+/* Programmer-family differences live in xgpro_models.h, shared with the
+ * Windows shim, so adding a family is one table row. */
+static const xgpro_model_t XGPRO_MODELS[] = {
+#define X(pid_, name_, guid_, ei, eip, eo, eop, ue, dop, st, fl) \
+    { .pid = pid_, .name = name_, .guid = guid_, \
+      .ep_in = ei, .ep_in_peer = eip, .ep_out = eo, .ep_out_peer = eop, \
+      .unused_in_ep = ue, .drain_on_opcode = dop, .settle_ms = st, \
+      .flags = fl },
+    XGPRO_MODEL_TABLE(X)
+#undef X
 };
 #define XGPRO_MODEL_COUNT ((int)(sizeof(XGPRO_MODELS) / sizeof(XGPRO_MODELS[0])))
 
@@ -56,7 +48,7 @@ static int send_all(int fd, const void *buf, size_t len);
 static uint8_t bulk_eps[MAX_BULK_EPS];
 static int bulk_ep_count = 0;
 static const char *model_name = NULL;
-static const struct xgpro_model *model = NULL;   /* profile of the opened device */
+static const xgpro_model_t *model = NULL;   /* profile of the opened device */
 static int srv_fd = -1;
 static int active_client = -1;
 static pthread_t event_thread;
@@ -68,19 +60,19 @@ static int clients_running = 0;
 
 static void handle_client(int client_fd);
 static void close_device(void);
-static int open_device(void);
-static int open_device_locked(void);
+static int open_device(uint16_t requested_pid);
+static int open_device_locked(uint16_t requested_pid);
 
-static int open_device(void) {
+static int open_device(uint16_t requested_pid) {
     int r;
     pthread_mutex_lock(&dev_mu);
-    r = open_device_locked();
+    r = open_device_locked(requested_pid);
     pthread_mutex_unlock(&dev_mu);
     return r;
 }
 
-static int device_acquire(void) {
-    if (open_device() != 0) return -1;
+static int device_acquire(uint16_t requested_pid) {
+    if (open_device(requested_pid) != 0) return -1;
     pthread_mutex_lock(&dev_mu);
     device_users++;
     pthread_mutex_unlock(&dev_mu);
@@ -182,9 +174,9 @@ static void sibling_cache_clear(void)
 
 static uint8_t payload_sibling(uint8_t ep)
 {
-    if (!model || !model->payload_in_peer) return 0;
-    if (ep == model->payload_in)      return model->payload_in_peer;
-    if (ep == model->payload_in_peer) return model->payload_in;
+    if (!model || !model->ep_in_peer) return 0;
+    if (ep == model->ep_in)      return model->ep_in_peer;
+    if (ep == model->ep_in_peer) return model->ep_in;
     return 0;
 }
 
@@ -293,15 +285,15 @@ static int handle_paired_write(int client_fd, bridge_request_t *req,
     io_job_t a, b;
     int timeout;
 
-    if (!dev_handle || !model || !model->payload_out_peer)
+    if (!dev_handle || !model || !model->ep_out_peer)
         return -1;
     if (req->length < PAIR_MIN_LEN)
         return -1;
-    if (req->pipe_id != model->payload_out && req->pipe_id != model->payload_out_peer)
+    if (req->pipe_id != model->ep_out && req->pipe_id != model->ep_out_peer)
         return -1;
 
-    other = (req->pipe_id == model->payload_out) ? model->payload_out_peer
-                                                 : model->payload_out;
+    other = (req->pipe_id == model->ep_out) ? model->ep_out_peer
+                                            : model->ep_out;
 
     /* The sibling of what we are holding? Send the pair together. */
     if (pending_write.valid && pending_write.ep == other &&
@@ -457,7 +449,7 @@ static void *client_thread(void *arg)
 }
 
 static void close_device(void);
-static int open_device(void);
+static int open_device(uint16_t requested_pid);
 
 static void sig_handler(int sig) {
     (void)sig;
@@ -595,7 +587,7 @@ static int retry_first_command(uint8_t ep, uint8_t *buf, uint32_t len, int *tran
     int r;
 
     close_device();
-    if (open_device() != 0)
+    if (open_device(model ? model->pid : 0) != 0)
         return LIBUSB_ERROR_NO_DEVICE;
 
     *transferred = 0;
@@ -626,25 +618,74 @@ static void drain_payload_ep(uint8_t ep)
         fprintf(stderr, "[bridge] drained %d stale bytes from ep 0x%02x\n", total, ep);
 }
 
-static int open_device_locked(void) {
-    if (dev_handle) return 0;
+static const xgpro_model_t *model_by_pid(uint16_t pid)
+{
+    for (int i = 0; i < XGPRO_MODEL_COUNT; i++)
+        if (XGPRO_MODELS[i].pid == pid)
+            return &XGPRO_MODELS[i];
+    return NULL;
+}
+
+static int model_has_ep(uint8_t ep)
+{
+    for (int i = 0; i < bulk_ep_count; i++)
+        if (bulk_eps[i] == ep)
+            return 1;
+    return 0;
+}
+
+static int validate_model_endpoints(const xgpro_model_t *m)
+{
+    if (!m || !model_has_ep(m->ep_in) || !model_has_ep(m->ep_out))
+        return -1;
+    if (m->ep_in_peer && !model_has_ep(m->ep_in_peer))
+        return -1;
+    if (m->ep_out_peer && !model_has_ep(m->ep_out_peer))
+        return -1;
+    return 0;
+}
+
+static int open_device_locked(uint16_t requested_pid) {
+    if (dev_handle) {
+        if (requested_pid && model && model->pid != requested_pid) {
+            fprintf(stderr, "[bridge] refusing PID %04x: %s is already open\n",
+                    requested_pid, model->name);
+            return -1;
+        }
+        return 0;
+    }
+
+    const xgpro_model_t *want = NULL;
+    if (requested_pid) {
+        want = model_by_pid(requested_pid);
+        if (!want) {
+            fprintf(stderr, "[bridge] requested PID %04x is not a known model\n",
+                    requested_pid);
+            return -1;
+        }
+    }
 
     int waited = 0;
 
     for (;;) {
         for (int i = 0; i < XGPRO_MODEL_COUNT && !dev_handle; i++) {
+            if (want && &XGPRO_MODELS[i] != want)
+                continue;
             dev_handle = libusb_open_device_with_vid_pid(ctx, XGPRO_VID, XGPRO_MODELS[i].pid);
             if (dev_handle) {
                 model = &XGPRO_MODELS[i];
-                model_name = XGPRO_MODELS[i].name;
+                model_name = model->name;
             }
         }
         if (dev_handle) break;
 
         if (waited >= OPEN_RETRY_TIMEOUT_MS) {
             fprintf(stderr, "[bridge] No XGecu programmer found (VID=%04x PIDs:", XGPRO_VID);
-            for (int i = 0; i < XGPRO_MODEL_COUNT; i++)
-                fprintf(stderr, " %04x", XGPRO_MODELS[i].pid);
+            if (want)
+                fprintf(stderr, " %04x", want->pid);
+            else
+                for (int i = 0; i < XGPRO_MODEL_COUNT; i++)
+                    fprintf(stderr, " %04x", XGPRO_MODELS[i].pid);
             fprintf(stderr, ")\n");
             return -1;
         }
@@ -697,12 +738,26 @@ static int open_device_locked(void) {
     }
 
     if (discover_bulk_endpoints() < 0) {
-        fprintf(stderr, "[bridge] Falling back to TL866 endpoint layout\n");
+        fprintf(stderr, "[bridge] Falling back to TL866 endpoint layout (cannot validate %s)\n",
+                model_name);
         bulk_eps[0] = 0x01;
         bulk_eps[1] = 0x81;
         bulk_eps[2] = 0x02;
         bulk_eps[3] = 0x82;
         bulk_ep_count = 4;
+    } else if (validate_model_endpoints(model) < 0) {
+        fprintf(stderr, "[bridge] %s: descriptor endpoints do not match the model "
+                "(in=0x%02x/0x%02x out=0x%02x/0x%02x)\n",
+                model_name, model->ep_in, model->ep_in_peer,
+                model->ep_out, model->ep_out_peer);
+        libusb_release_interface(dev_handle, 0);
+        if (kernel_driver_detached) {
+            libusb_attach_kernel_driver(dev_handle, 0);
+            kernel_driver_detached = 0;
+        }
+        libusb_close(dev_handle);
+        dev_handle = NULL;
+        return -1;
     }
 
     /* No SET_INTERFACE / CLEAR_HALT here on purpose. The device is already
@@ -793,6 +848,8 @@ static int authenticate_client(int client_fd) {
 
 static void handle_client(int client_fd) {
     int owns_device = 0;
+    int hello_seen = 0;
+    uint16_t client_pid = 0;
     fprintf(stderr, "[bridge] XGPro connected\n");
 
     if (authenticate_client(client_fd) < 0) {
@@ -826,12 +883,37 @@ static void handle_client(int client_fd) {
         }
 
         switch (req.cmd) {
+        case CMD_HELLO: {
+            bridge_hello_t hello;
+            if (recv_all(client_fd, &hello, sizeof(hello)) < 0) goto disconnect;
+            resp.length = BRIDGE_PROTO_VERSION;
+            if (hello.version != BRIDGE_PROTO_VERSION) {
+                fprintf(stderr, "[bridge] protocol mismatch: shim v%u, daemon v%u\n",
+                        hello.version, BRIDGE_PROTO_VERSION);
+                resp.status = -1;
+            } else {
+                client_pid = hello.pid;
+                hello_seen = 1;
+                resp.status = 0;
+                fprintf(stderr, "[bridge] protocol v%u, requested PID %04x\n",
+                        hello.version, hello.pid);
+            }
+            if (send_all(client_fd, &resp, sizeof(resp)) < 0) goto disconnect;
+            break;
+        }
+
         case CMD_OPEN:
             if (!owns_device) {
-                if (device_acquire() == 0) { owns_device = 1; resp.status = 0; }
-                else resp.status = -1;
+                if (device_acquire(hello_seen ? client_pid : 0) == 0) {
+                    owns_device = 1;
+                    resp.status = 0;
+                } else {
+                    resp.status = -1;
+                }
             } else {
-                resp.status = dev_handle ? 0 : -1;
+                resp.status = (dev_handle &&
+                               (!client_pid || (model && model->pid == client_pid))) ?
+                                  0 : -1;
             }
             if (send_all(client_fd, &resp, sizeof(resp)) < 0) goto disconnect;
             break;
@@ -900,9 +982,10 @@ static void handle_client(int client_fd) {
                  * a paired family the halves belong to an in-flight transfer
                  * and draining one would steal data. Use the profile instead
                  * of a hardcoded 0x82. */
-                if (req.pipe_id == 0x01 && req.length >= 1 && data_buf[0] == 0x0D &&
-                    model && model->payload_in && model->payload_in_peer == 0)
-                    drain_payload_ep(model->payload_in);
+                if (model && model->drain_on_opcode &&
+                    req.pipe_id == 0x01 && req.length >= 1 &&
+                    data_buf[0] == model->drain_on_opcode)
+                    drain_payload_ep(model->ep_in);
 
                 int r = do_transfer(req.pipe_id,
                                     data_buf, req.length,

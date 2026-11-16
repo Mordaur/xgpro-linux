@@ -16,40 +16,11 @@
 #include <string.h>
 
 
-#define BRIDGE_PORT 7372
+#include "bridge_proto.h"
+#include "xgpro_models.h"
+
 #define MAX_TRANSFER_LEN (16 * 1024 * 1024)
-#define BRIDGE_TOKEN_LEN 32
 #define BRIDGE_TOKEN_PATH_WINE "\\\\?\\unix\\tmp\\.xgpro-bridge-token"
-
-enum bridge_cmd {
-    CMD_OPEN = 1,
-    CMD_CLOSE,
-    CMD_READ_PIPE,
-    CMD_WRITE_PIPE,
-    CMD_SET_PIPE_POLICY,
-    CMD_FLUSH_PIPE,
-    CMD_ABORT_PIPE,
-    CMD_SUBSCRIBE,
-};
-
-typedef struct {
-    uint8_t  evt;    /* 1 = arrived, 0 = removed */
-    uint16_t pid;
-} bridge_event_t;
-
-#pragma pack(push, 1)
-typedef struct {
-    uint8_t cmd;
-    uint8_t pipe_id;
-    uint32_t length;
-    uint32_t timeout_ms;   /* 0 = use the daemon default */
-} bridge_request_t;
-
-typedef struct {
-    int32_t status;
-    uint32_t length;
-} bridge_response_t;
-#pragma pack(pop)
 
 typedef struct {
     DWORD cbSize;
@@ -63,25 +34,19 @@ typedef struct {
     char  DevicePath[260];
 } MY_SP_DEVICE_INTERFACE_DETAIL_DATA_A;
 
-/* DeviceInterfaceGUIDs come from the vendor INF shipped with each Xgpro
- * release, and the app compares whatever it passes to SetupDiGetClassDevsA.
- * T48/T56/TL866II Plus and the T76 use different GUIDs. */
-#define XGPRO_PID_T48 0x0A53
-#define XGPRO_PID_T76 0x1A86
-
-typedef struct {
-    GUID        guid;
-    uint16_t    pid;
-    const char *name;
-} xgpro_profile_t;
-
-static const xgpro_profile_t XGPRO_PROFILES[] = {
-    { { 0xE7E8BA13, 0x2A81, 0x446E, { 0xA1, 0x1E, 0x72, 0x39, 0x8F, 0xBD, 0xA8, 0x2F } },
-      XGPRO_PID_T48, "T48" },
-    { { 0x015DE341, 0x91CC, 0x8286, { 0x39, 0x64, 0x1A, 0x00, 0x6B, 0xC1, 0xF0, 0x0F } },
-      XGPRO_PID_T76, "T76" },
+/* Device-family identity lives in xgpro_models.h, shared with the daemon.
+ * The app's SetupDi GUID selects the profile; CMD_HELLO tells the daemon
+ * which PID to open, so the two sides cannot disagree. */
+static const xgpro_model_t XGPRO_MODELS[] = {
+#define X(pid_, name_, guid_, ei, eip, eo, eop, ue, dop, st, fl) \
+    { .pid = pid_, .name = name_, .guid = guid_, \
+      .ep_in = ei, .ep_in_peer = eip, .ep_out = eo, .ep_out_peer = eop, \
+      .unused_in_ep = ue, .drain_on_opcode = dop, .settle_ms = st, \
+      .flags = fl },
+    XGPRO_MODEL_TABLE(X)
+#undef X
 };
-#define XGPRO_PROFILE_COUNT ((int)(sizeof(XGPRO_PROFILES) / sizeof(XGPRO_PROFILES[0])))
+#define XGPRO_MODEL_COUNT ((int)(sizeof(XGPRO_MODELS) / sizeof(XGPRO_MODELS[0])))
 
 static int selected_profile = -1;
 static volatile LONG sub_started = 0;
@@ -96,28 +61,28 @@ static char fake_dev_path[260];
 #define FAKE_WINUSB_HANDLE  ((void *)(ULONG_PTR)0xBE000001)
 
 static int profile_index_for_guid(const GUID *guid) {
-    for (int i = 0; i < XGPRO_PROFILE_COUNT; i++) {
-        if (memcmp(guid, &XGPRO_PROFILES[i].guid, sizeof(GUID)) == 0)
+    for (int i = 0; i < XGPRO_MODEL_COUNT; i++) {
+        if (memcmp(guid, &XGPRO_MODELS[i].guid, sizeof(xgpro_guid_t)) == 0)
             return i;
     }
     return -1;
 }
 
-static const xgpro_profile_t *current_profile(void) {
+static const xgpro_model_t *current_profile(void) {
     if (selected_profile < 0) selected_profile = 0;
-    return &XGPRO_PROFILES[selected_profile];
+    return &XGPRO_MODELS[selected_profile];
 }
 
 static const char *device_path(void) {
-    const xgpro_profile_t *p = current_profile();
-    const GUID *g = &p->guid;
+    const xgpro_model_t *p = current_profile();
+    const xgpro_guid_t *g = &p->guid;
 
     snprintf(fake_dev_path, sizeof(fake_dev_path),
              "\\\\?\\USB#VID_A466&PID_%04X#%s#{%08lX-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X}",
              p->pid, p->name,
-             (unsigned long)g->Data1, g->Data2, g->Data3,
-             g->Data4[0], g->Data4[1], g->Data4[2], g->Data4[3],
-             g->Data4[4], g->Data4[5], g->Data4[6], g->Data4[7]);
+             (unsigned long)g->d1, g->d2, g->d3,
+             g->d4[0], g->d4[1], g->d4[2], g->d4[3],
+             g->d4[4], g->d4[5], g->d4[6], g->d4[7]);
     return fake_dev_path;
 }
 
@@ -151,6 +116,7 @@ static void dbg(const char *fmt, ...) {
 
 
 static int bridge_send(const void *buf, int len);
+static int bridge_recv(void *buf, int len);
 
 static int bridge_connect(void) {
     if (bridge_sock != INVALID_SOCKET) return 0;
@@ -224,6 +190,24 @@ static int bridge_connect(void) {
         dbg("Auth token sent to bridge daemon");
     }
 
+    {
+        bridge_request_t hreq = { CMD_HELLO, 0, 0 };
+        bridge_hello_t hello;
+        bridge_response_t resp = { 0, 0 };
+        hello.version = BRIDGE_PROTO_VERSION;
+        hello.pid = (selected_profile >= 0) ? XGPRO_MODELS[selected_profile].pid : 0;
+        if (bridge_send(&hreq, sizeof(hreq)) < 0 ||
+            bridge_send(&hello, sizeof(hello)) < 0 ||
+            bridge_recv(&resp, sizeof(resp)) < 0 || resp.status != 0) {
+            dbg("Bridge rejected protocol v%u / PID %04x (status %d, daemon v%u)",
+                hello.version, hello.pid, resp.status, resp.length);
+            bridge_disconnect();
+            SetLastError(ERROR_REVISION_MISMATCH);
+            return -1;
+        }
+        dbg("Bridge protocol v%u, requested PID %04x", hello.version, hello.pid);
+    }
+
     return 0;
 }
 
@@ -258,7 +242,7 @@ static HANDLE WINAPI my_SetupDiGetClassDevsA(
         if (idx >= 0) {
             selected_profile = idx;
             dbg("SetupDiGetClassDevsA: matched %s GUID -> returning fake HDEVINFO",
-                XGPRO_PROFILES[idx].name);
+                XGPRO_MODELS[idx].name);
             return FAKE_HDEVINFO;
         }
     }
@@ -276,7 +260,7 @@ static BOOL WINAPI my_SetupDiEnumDeviceInterfaces(
         dbg("SetupDiEnumDeviceInterfaces: returning %s at index 0", current_profile()->name);
         if (DeviceInterfaceData) {
             DeviceInterfaceData->cbSize = sizeof(MY_SP_DEVICE_INTERFACE_DATA);
-            memcpy(&DeviceInterfaceData->InterfaceClassGuid, &current_profile()->guid, sizeof(GUID));
+            memcpy(&DeviceInterfaceData->InterfaceClassGuid, &current_profile()->guid, sizeof(xgpro_guid_t));
             DeviceInterfaceData->Flags = 1;
             DeviceInterfaceData->Reserved = 0;
         }
@@ -978,7 +962,15 @@ __declspec(dllexport) BOOL __stdcall WinUsb_GetDescriptor(
     return FALSE;
 }
 
-__declspec(dllexport) BOOL __stdcall WinUsb_ControlTransfer(void *h, void *sp, UCHAR *buf, ULONG len, PULONG xfer, void *ol) { dbg("WinUsb_ControlTransfer (stub)"); return FALSE; }
+__declspec(dllexport) BOOL __stdcall WinUsb_ControlTransfer(void *h, void *sp, UCHAR *buf, ULONG len, PULONG xfer, void *ol)
+{
+    const UCHAR *setup = (const UCHAR *)sp;
+    dbg("WinUsb_ControlTransfer: unsupported (bmRequestType=0x%02x bRequest=0x%02x len=%lu)",
+        setup ? setup[0] : 0, setup ? setup[1] : 0, (unsigned long)len);
+    SetLastError(ERROR_NOT_SUPPORTED);
+    if (xfer) *xfer = 0;
+    return FALSE;
+}
 __declspec(dllexport) BOOL __stdcall WinUsb_GetAssociatedInterface(void *h, UCHAR idx, void **ah) { dbg("WinUsb_GetAssociatedInterface idx=%u", idx); SetLastError(ERROR_NO_MORE_ITEMS); return FALSE; }
 __declspec(dllexport) BOOL __stdcall WinUsb_GetCurrentAlternateSetting(void *h, PUCHAR alt) { dbg("WinUsb_GetCurrentAlternateSetting"); if (alt) *alt = 0; return TRUE; }
 __declspec(dllexport) BOOL __stdcall WinUsb_GetOverlappedResult(void *h, void *ol, PULONG xfer, BOOL wait) { dbg("WinUsb_GetOverlappedResult (stub)"); return FALSE; }

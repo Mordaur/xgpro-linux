@@ -9,10 +9,10 @@ BINDIR ?= $(HOME)/.local/bin
 
 all: winusb.dll bridge_daemon
 
-winusb.dll: winusb_bridge.c winusb.def
+winusb.dll: winusb_bridge.c winusb.def bridge_proto.h xgpro_models.h
 	$(CC_WIN) $(CFLAGS) -shared -o $@ winusb_bridge.c winusb.def -lws2_32 -Wl,--enable-stdcall-fixup
 
-bridge_daemon: bridge_daemon.c bridge_proto.h
+bridge_daemon: bridge_daemon.c bridge_proto.h xgpro_models.h
 	$(CC) $(CFLAGS) -o $@ bridge_daemon.c -lusb-1.0 -lpthread
 
 clean:
