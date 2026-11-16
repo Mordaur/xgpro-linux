@@ -2,7 +2,7 @@
 # Launch Xgpro under Wine with the USB bridge.
 #
 #   ./xgpro.sh                     Xgpro.exe       (T48 / T56 / TL866II Plus)
-#   XGPRO_APP=Xgpro_T76 ./xgpro.sh Xgpro_T76.exe  (T76)
+#   XGPRO_APP=Xgpro_T76 XGPRO_EXE=Xgpro_T76.exe ./xgpro.sh   (T76)
 #
 # Environment:
 #   WINEPREFIX   Wine prefix (default: ~/.wine-xgecu)
@@ -15,7 +15,7 @@ set -u
 WINEPREFIX="${WINEPREFIX:-$HOME/.wine-xgecu}"
 APP_DIR="${XGPRO_APP:-Xgpro}"
 TARGET_EXE="${XGPRO_EXE:-Xgpro.exe}"
-BROKER="${XGPRO_BRIDGE:-xgpro-bridge}"
+BROKER="${XGPRO_BRIDGE:-$HOME/.local/bin/xgpro-bridge}"
 
 if ! pgrep -x "$(basename "$BROKER")" >/dev/null 2>&1; then
     echo "Starting USB bridge daemon..."

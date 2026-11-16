@@ -20,6 +20,10 @@ clean:
 
 install: winusb.dll bridge_daemon
 	install -Dm644 winusb.dll $(WINEPREFIX)/drive_c/$(APP_DIR)/winusb.dll
+	@if [ -d "$(WINEPREFIX)/drive_c/Xgpro_T76" ] && [ "$(APP_DIR)" != "Xgpro_T76" ]; then \
+		install -Dm644 winusb.dll "$(WINEPREFIX)/drive_c/Xgpro_T76/winusb.dll"; \
+		echo "Installed shim into $(WINEPREFIX)/drive_c/Xgpro_T76 too"; \
+	fi
 	install -Dm755 bridge_daemon $(BINDIR)/xgpro-bridge
 	install -Dm755 xgpro.sh $(BINDIR)/xgpro
 	@echo "Installed shim into $(WINEPREFIX)/drive_c/$(APP_DIR) and xgpro into $(BINDIR)"
