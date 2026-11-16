@@ -389,6 +389,9 @@ static int bridge_enumerate(void)
     bridge_request_t req = { CMD_ENUMERATE, 0, 0 };
     bridge_response_t resp = { 0, 0 };
     uint32_t count = 0, i;
+    /* Xgpro/Minipro have four usb_handle/winusb_handle slots; Xgpro_T76 has
+     * one.  Never advertise more than the app can store. */
+    int app_max = (pid == 0x1A86) ? 1 : 4;
     int n = 0, target;
 
     if (s == INVALID_SOCKET) {
@@ -407,7 +410,7 @@ static int bridge_enumerate(void)
         bridge_dev_info_t d;
         if (sock_recv_all(s, &d, sizeof(d)) < 0) break;
         if (pid && d.pid != pid) continue;
-        if (n >= BRIDGE_MAX_DEVICES) continue;
+        if (n >= app_max) continue;
         memset(&enum_devs[n], 0, sizeof(enum_devs[n]));
         snprintf(enum_devs[n].path, sizeof(enum_devs[n].path), "%s", d.path);
         snprintf(enum_devs[n].product, sizeof(enum_devs[n].product), "%s", d.product);
@@ -422,7 +425,8 @@ static int bridge_enumerate(void)
      * N programmers.  The fakes are local to the shim and never touch the
      * daemon or libusb. */
     target = fake_total();
-    while (target > 1 && n < target && n < BRIDGE_MAX_DEVICES) {
+    if (target > app_max) target = app_max;
+    while (target > 1 && n < target && n < app_max) {
         int fi = n;
         memset(&enum_devs[n], 0, sizeof(enum_devs[n]));
         snprintf(enum_devs[n].path, sizeof(enum_devs[n].path), "FAKE%d", fi);
