@@ -109,9 +109,15 @@ make && make install
 
 The shim and daemon speak protocol v2: on connect the shim sends `CMD_HELLO`
 with the protocol version and the PID selected by the app's SetupDi GUID, and
-the daemon opens exactly that PID and validates its descriptor endpoints
-against the model. Rebuild both halves together; a version mismatch is reported
-as a clean error instead of a desynchronised transfer.
+the daemon opens exactly that PID. Within a PID, rows are ordered
+most-specific first and the daemon picks the first row whose required endpoints
+are present in the descriptor. That is how the II+ (6 endpoints), T48 (4) and
+T56 (2) are distinguished despite sharing PID `0x0A53`. An unknown layout is
+reported with the discovered endpoint list instead of being driven with the
+wrong pair.
+
+Rebuild both halves together; a version mismatch is reported as a clean error
+instead of a desynchronised transfer.
 
 Known gap: `WinUsb_ControlTransfer` is not forwarded (Xgpro uses bulk only).
 It now logs the setup packet and returns `ERROR_NOT_SUPPORTED`, so a future
