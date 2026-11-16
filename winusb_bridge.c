@@ -266,6 +266,9 @@ static BOOL WINAPI my_SetupDiEnumDeviceInterfaces(
         }
         return TRUE;
     }
+    if (getenv("XGPRO_DEBUG"))
+        dbg("SetupDiEnumDeviceInterfaces: index=%lu -> ERROR_NO_MORE_ITEMS",
+            (unsigned long)MemberIndex);
     SetLastError(ERROR_NO_MORE_ITEMS);
     return FALSE;
 }
