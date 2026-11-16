@@ -892,7 +892,7 @@ static void handle_client(int client_fd) {
                 int transferred = 0;
                 if (verbose) {
                     fprintf(stderr, "[bridge] WRITE ep=0x%02x len=%u data=", req.pipe_id, req.length);
-                    for (uint32_t i = 0; i < req.length && i < 32; i++)
+                    for (uint32_t i = 0; i < req.length && i < 160; i++)
                         fprintf(stderr, "%02x ", data_buf[i]);
                     fprintf(stderr, "\n");
                 }
