@@ -9,6 +9,9 @@
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <sys/file.h>
+#include <sys/wait.h>
+#include <sys/prctl.h>
 #include <libusb-1.0/libusb.h>
 #include <pthread.h>
 #include "bridge_proto.h"
@@ -49,30 +52,29 @@ static uint8_t bulk_eps[MAX_BULK_EPS];
 static int bulk_ep_count = 0;
 static const char *model_name = NULL;
 static const xgpro_model_t *model = NULL;   /* profile of the opened device */
+static char device_path[BRIDGE_PATH_LEN];   /* last successfully opened device */
+static int dev_lock_fd = -1;                /* cross-process exclusive-open lock */
 static int srv_fd = -1;
 static int active_client = -1;
 static pthread_t event_thread;
 static int event_thread_started = 0;
-static pthread_mutex_t clients_mu = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t clients_cv = PTHREAD_COND_INITIALIZER;
-static int clients_running = 0;
 
 
 static void handle_client(int client_fd);
 static void close_device(void);
-static int open_device(uint16_t requested_pid);
-static int open_device_locked(uint16_t requested_pid);
+static int open_device(const char *path, uint16_t requested_pid);
+static int open_device_locked(const char *path, uint16_t requested_pid);
 
-static int open_device(uint16_t requested_pid) {
+static int open_device(const char *path, uint16_t requested_pid) {
     int r;
     pthread_mutex_lock(&dev_mu);
-    r = open_device_locked(requested_pid);
+    r = open_device_locked(path, requested_pid);
     pthread_mutex_unlock(&dev_mu);
     return r;
 }
 
-static int device_acquire(uint16_t requested_pid) {
-    if (open_device(requested_pid) != 0) return -1;
+static int device_acquire(const char *path, uint16_t requested_pid) {
+    if (open_device(path, requested_pid) != 0) return -1;
     pthread_mutex_lock(&dev_mu);
     device_users++;
     pthread_mutex_unlock(&dev_mu);
@@ -198,7 +200,17 @@ static int do_transfer(uint8_t ep, uint8_t *buf, uint32_t len,
     transfers_in_flight++;
     pthread_mutex_unlock(&dev_mu);
 
-    r = libusb_bulk_transfer(h, ep, buf, len, transferred, timeout);
+    {
+        struct timeval t0, t1;
+        gettimeofday(&t0, NULL);
+        r = libusb_bulk_transfer(h, ep, buf, len, transferred, timeout);
+        gettimeofday(&t1, NULL);
+        if (verbose)
+            fprintf(stderr, "[bridge] bulk ep=0x%02x len=%u timeout=%d -> %d (%s) %ld ms\n",
+                    ep, len, timeout, r, libusb_error_name(r),
+                    (long)((t1.tv_sec - t0.tv_sec) * 1000 +
+                           (t1.tv_usec - t0.tv_usec) / 1000));
+    }
 
     pthread_mutex_lock(&dev_mu);
     transfers_in_flight--;
@@ -434,22 +446,8 @@ static int handle_paired_read(int client_fd, bridge_request_t *req,
     return 0;
 }
 
-static void *client_thread(void *arg)
-{
-    int fd = (int)(intptr_t)arg;
-    handle_client(fd);
-    active_client = -1;
-    close(fd);
-
-    pthread_mutex_lock(&clients_mu);
-    clients_running--;
-    pthread_cond_signal(&clients_cv);
-    pthread_mutex_unlock(&clients_mu);
-    return NULL;
-}
-
 static void close_device(void);
-static int open_device(uint16_t requested_pid);
+static int open_device(const char *path, uint16_t requested_pid);
 
 static void sig_handler(int sig) {
     (void)sig;
@@ -587,7 +585,7 @@ static int retry_first_command(uint8_t ep, uint8_t *buf, uint32_t len, int *tran
     int r;
 
     close_device();
-    if (open_device(model ? model->pid : 0) != 0)
+    if (open_device(device_path, model ? model->pid : 0) != 0)
         return LIBUSB_ERROR_NO_DEVICE;
 
     *transferred = 0;
@@ -661,7 +659,135 @@ static int pid_seen(const uint16_t *pids, int n, uint16_t pid)
     return 0;
 }
 
-static int open_device_locked(uint16_t requested_pid) {
+static void device_path_str(libusb_device *dev, char *buf, size_t len)
+{
+    snprintf(buf, len, "%u:%u", libusb_get_bus_number(dev),
+             libusb_get_device_address(dev));
+}
+
+static int collect_bulk_eps(libusb_device *dev, uint8_t *eps, int max)
+{
+    struct libusb_config_descriptor *cfg = NULL;
+    int n = 0;
+    if (libusb_get_active_config_descriptor(dev, &cfg) < 0)
+        return 0;
+    if (cfg->bNumInterfaces > 0 && cfg->interface[0].num_altsetting > 0) {
+        const struct libusb_interface_descriptor *alt =
+            &cfg->interface[0].altsetting[0];
+        for (int i = 0; i < alt->bNumEndpoints && n < max; i++) {
+            const struct libusb_endpoint_descriptor *e = &alt->endpoint[i];
+            if ((e->bmAttributes & LIBUSB_TRANSFER_TYPE_MASK) ==
+                LIBUSB_TRANSFER_TYPE_BULK)
+                eps[n++] = e->bEndpointAddress;
+        }
+    }
+    libusb_free_config_descriptor(cfg);
+    return n;
+}
+
+static uint32_t enumerate_devices(bridge_dev_info_t *out, uint32_t max)
+{
+    libusb_device **list = NULL;
+    ssize_t n = libusb_get_device_list(ctx, &list);
+    uint32_t count = 0;
+    if (n < 0)
+        return 0;
+    for (ssize_t i = 0; i < n && count < max; i++) {
+        struct libusb_device_descriptor dd;
+        uint8_t eps[MAX_BULK_EPS];
+        const xgpro_model_t *m;
+        int ne;
+        if (libusb_get_device_descriptor(list[i], &dd) < 0)
+            continue;
+        if (dd.idVendor != XGPRO_VID)
+            continue;
+        ne = collect_bulk_eps(list[i], eps, MAX_BULK_EPS);
+        m = model_for_device(dd.idProduct, eps, ne);
+        if (!m)
+            continue;
+        memset(&out[count], 0, sizeof(out[count]));
+        out[count].vid = dd.idVendor;
+        out[count].pid = dd.idProduct;
+        out[count].bus = libusb_get_bus_number(list[i]);
+        out[count].addr = libusb_get_device_address(list[i]);
+        device_path_str(list[i], out[count].path, sizeof(out[count].path));
+        snprintf(out[count].product, sizeof(out[count].product), "%s", m->name);
+        count++;
+    }
+    libusb_free_device_list(list, 1);
+    return count;
+}
+
+static int acquire_device_lock(const char *path)
+{
+    char lock[160];
+    int fd;
+    if (dev_lock_fd >= 0)
+        return 0;
+    snprintf(lock, sizeof(lock), "/tmp/.xgpro-bridge-%s.lock", path);
+    fd = open(lock, O_CREAT | O_RDWR, 0600);
+    if (fd < 0)
+        return -1;
+    if (flock(fd, LOCK_EX | LOCK_NB) < 0) {
+        close(fd);
+        fprintf(stderr, "[bridge] %s is already open by another process\n", path);
+        return -1;
+    }
+    dev_lock_fd = fd;
+    return 0;
+}
+
+/* Returns 0 on success, -1 if absent, -2 if present but busy. */
+static int open_by_path(const char *want, uint16_t pid, uint16_t *opened_pid)
+{
+    libusb_device **list = NULL;
+    ssize_t n = libusb_get_device_list(ctx, &list);
+    int rc = -1;
+    if (n < 0)
+        return -1;
+    for (ssize_t i = 0; i < n; i++) {
+        struct libusb_device_descriptor dd;
+        char path[BRIDGE_PATH_LEN];
+        if (libusb_get_device_descriptor(list[i], &dd) < 0)
+            continue;
+        if (dd.idVendor != XGPRO_VID)
+            continue;
+        if (pid && dd.idProduct != pid)
+            continue;
+        device_path_str(list[i], path, sizeof(path));
+        if (want && *want && strcmp(path, want) != 0)
+            continue;
+        if (acquire_device_lock(path) < 0) {
+            if (want && *want) {
+                rc = -2;
+                break;
+            }
+            continue;
+        }
+        if (libusb_open(list[i], &dev_handle) == 0) {
+            *opened_pid = dd.idProduct;
+            snprintf(device_path, sizeof(device_path), "%s", path);
+            rc = 0;
+            break;
+        }
+        if (dev_lock_fd >= 0) {
+            close(dev_lock_fd);
+            dev_lock_fd = -1;
+        }
+    }
+    libusb_free_device_list(list, 1);
+    return rc;
+}
+
+static void release_device_lock(void)
+{
+    if (dev_lock_fd >= 0) {
+        close(dev_lock_fd);
+        dev_lock_fd = -1;
+    }
+}
+
+static int open_device_locked(const char *path, uint16_t requested_pid) {
     if (dev_handle) {
         if (requested_pid && model && model->pid != requested_pid) {
             fprintf(stderr, "[bridge] refusing PID %04x: %s is already open\n",
@@ -693,14 +819,9 @@ static int open_device_locked(uint16_t requested_pid) {
     int waited = 0;
 
     for (;;) {
-        for (int i = 0; i < npids && !dev_handle; i++) {
-            dev_handle = libusb_open_device_with_vid_pid(ctx, XGPRO_VID, pids[i]);
-            if (dev_handle) {
-                opened_pid = pids[i];
-                break;
-            }
-        }
-        if (dev_handle) break;
+        int orc = open_by_path(path, requested_pid, &opened_pid);
+        if (orc == 0) break;
+        if (orc == -2) return -1;
 
         if (waited >= OPEN_RETRY_TIMEOUT_MS) {
             fprintf(stderr, "[bridge] No XGecu programmer found (VID=%04x PIDs:", XGPRO_VID);
@@ -742,6 +863,7 @@ static int open_device_locked(uint16_t requested_pid) {
             libusb_close(dev_handle);
             dev_handle = NULL;
             kernel_driver_detached = 0;
+            release_device_lock();
             return -1;
         }
     } else if (verbose) {
@@ -754,6 +876,7 @@ static int open_device_locked(uint16_t requested_pid) {
         libusb_close(dev_handle);
         dev_handle = NULL;
         kernel_driver_detached = 0;
+        release_device_lock();
         return -1;
     }
 
@@ -786,11 +909,17 @@ static int open_device_locked(uint16_t requested_pid) {
             }
             libusb_close(dev_handle);
             dev_handle = NULL;
+            release_device_lock();
             return -1;
         }
     }
     model_name = model->name;
-    fprintf(stderr, "[bridge] Found %s (PID %04x)\n", model_name, opened_pid);
+    {
+        libusb_device *d = libusb_get_device(dev_handle);
+        fprintf(stderr, "[bridge] Found %s (PID %04x, bus %u addr %u)\n",
+                model_name, opened_pid, libusb_get_bus_number(d),
+                libusb_get_device_address(d));
+    }
 
     /* No SET_INTERFACE / CLEAR_HALT here on purpose. The device is already
      * on alt setting 0 with no halted endpoints, and issuing those requests
@@ -837,6 +966,7 @@ static void close_device(void) {
         }
         libusb_close(dev_handle);
         dev_handle = NULL;
+        release_device_lock();
         fprintf(stderr, "[bridge] Programmer closed\n");
     }
     pthread_mutex_unlock(&dev_mu);
@@ -934,9 +1064,27 @@ static void handle_client(int client_fd) {
             break;
         }
 
-        case CMD_OPEN:
+        case CMD_ENUMERATE: {
+            bridge_dev_info_t devs[BRIDGE_MAX_DEVICES];
+            uint32_t count = enumerate_devices(devs, BRIDGE_MAX_DEVICES);
+            resp.status = 0;
+            resp.length = (uint32_t)(sizeof(count) +
+                                     count * sizeof(bridge_dev_info_t));
+            if (send_all(client_fd, &resp, sizeof(resp)) < 0) goto disconnect;
+            if (send_all(client_fd, &count, sizeof(count)) < 0) goto disconnect;
+            if (count &&
+                send_all(client_fd, devs, count * sizeof(devs[0])) < 0)
+                goto disconnect;
+            break;
+        }
+
+        case CMD_OPEN: {
+            bridge_open_t open;
+            memset(&open, 0, sizeof(open));
+            if (recv_all(client_fd, &open, sizeof(open)) < 0) goto disconnect;
             if (!owns_device) {
-                if (device_acquire(hello_seen ? client_pid : 0) == 0) {
+                if (device_acquire(open.path,
+                                   hello_seen ? client_pid : 0) == 0) {
                     owns_device = 1;
                     resp.status = 0;
                 } else {
@@ -949,6 +1097,7 @@ static void handle_client(int client_fd) {
             }
             if (send_all(client_fd, &resp, sizeof(resp)) < 0) goto disconnect;
             break;
+        }
 
         case CMD_CLOSE:
             if (owns_device) { device_release(); owns_device = 0; }
@@ -1019,6 +1168,9 @@ static void handle_client(int client_fd) {
                     data_buf[0] == model->drain_on_opcode)
                     drain_payload_ep(model->ep_in);
 
+                if (verbose)
+                    fprintf(stderr, "[bridge] WRITE ep=0x%02x timeout=%d\n",
+                            req.pipe_id, transfer_timeout(req.timeout_ms));
                 int r = do_transfer(req.pipe_id,
                                     data_buf, req.length,
                                     &transferred, transfer_timeout(req.timeout_ms));
@@ -1184,27 +1336,7 @@ int main(int argc, char **argv) {
     sigaction(SIGINT, &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
     signal(SIGPIPE, SIG_IGN);
-
-    int r = libusb_init(&ctx);
-    if (r < 0) {
-        fprintf(stderr, "[bridge] libusb_init failed: %s\n", libusb_error_name(r));
-        return 1;
-    }
-
-    libusb_hotplug_callback_handle hp_handle;
-    int hp = libusb_hotplug_register_callback(ctx,
-        LIBUSB_HOTPLUG_EVENT_DEVICE_ARRIVED | LIBUSB_HOTPLUG_EVENT_DEVICE_LEFT,
-        LIBUSB_HOTPLUG_NO_FLAGS, XGPRO_VID, LIBUSB_HOTPLUG_MATCH_ANY,
-        LIBUSB_HOTPLUG_MATCH_ANY, hotplug_cb, NULL, &hp_handle);
-    if (hp != LIBUSB_SUCCESS) {
-        fprintf(stderr, "[bridge] hotplug unavailable: %s (device notifications disabled)\n",
-                libusb_error_name(hp));
-    } else {
-        if (pthread_create(&event_thread, NULL, usb_event_thread, NULL) == 0)
-            event_thread_started = 1;
-        else
-            fprintf(stderr, "[bridge] failed to start libusb event thread\n");
-    }
+    signal(SIGCHLD, SIG_IGN);   /* children are one-shot workers */
 
     srv_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (srv_fd < 0) {
@@ -1225,7 +1357,7 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    if (listen(srv_fd, 1) < 0) {
+    if (listen(srv_fd, 16) < 0) {
         perror("[bridge] listen");
         return 1;
     }
@@ -1252,44 +1384,56 @@ int main(int argc, char **argv) {
         int bufsize = 256 * 1024;
         setsockopt(client_fd, SOL_SOCKET, SO_RCVBUF, &bufsize, sizeof(bufsize));
         setsockopt(client_fd, SOL_SOCKET, SO_SNDBUF, &bufsize, sizeof(bufsize));
-        active_client = client_fd;
-        {
-            pthread_t t;
-            pthread_mutex_lock(&clients_mu);
-            clients_running++;
-            pthread_mutex_unlock(&clients_mu);
-            if (pthread_create(&t, NULL, client_thread, (void *)(intptr_t)client_fd) == 0)
-                pthread_detach(t);
-            else {
-                fprintf(stderr, "[bridge] failed to start client thread\n");
-                close(client_fd);
-                active_client = -1;
-                pthread_mutex_lock(&clients_mu);
-                clients_running--;
-                pthread_mutex_unlock(&clients_mu);
+
+        /* One worker process per connection: each connection owns at most one
+         * programmer, so the existing single-device state stays valid and two
+         * devices never share a libusb handle.  The parent keeps listening. */
+        pid_t pid = fork();
+        if (pid == 0) {
+            libusb_hotplug_callback_handle hp_handle;
+            int hp;
+            close(srv_fd);
+            srv_fd = -1;
+            active_client = client_fd;
+            prctl(PR_SET_PDEATHSIG, SIGTERM);
+
+            if (libusb_init(&ctx) < 0) {
+                fprintf(stderr, "[bridge] libusb_init failed in worker\n");
+                _exit(1);
             }
+            hp = libusb_hotplug_register_callback(ctx,
+                LIBUSB_HOTPLUG_EVENT_DEVICE_ARRIVED |
+                    LIBUSB_HOTPLUG_EVENT_DEVICE_LEFT,
+                LIBUSB_HOTPLUG_NO_FLAGS, XGPRO_VID, LIBUSB_HOTPLUG_MATCH_ANY,
+                LIBUSB_HOTPLUG_MATCH_ANY, hotplug_cb, NULL, &hp_handle);
+            if (hp != LIBUSB_SUCCESS) {
+                fprintf(stderr, "[bridge] hotplug unavailable in worker: %s\n",
+                        libusb_error_name(hp));
+            } else if (pthread_create(&event_thread, NULL, usb_event_thread,
+                                      NULL) == 0) {
+                event_thread_started = 1;
+            }
+
+            handle_client(client_fd);
+            close_device();
+            close(client_fd);
+            if (event_thread_started) {
+                running = 0;
+                pthread_join(event_thread, NULL);
+            }
+            libusb_exit(ctx);
+            _exit(0);
         }
+        if (pid < 0) {
+            perror("[bridge] fork");
+            close(client_fd);
+            continue;
+        }
+        close(client_fd);
     }
 
     if (srv_fd >= 0) close(srv_fd);
-
-    /* Wait for client threads to finish their transfers: libusb_exit()
-     * asserts (and aborts) if any thread is still inside the context. */
-    pthread_mutex_lock(&clients_mu);
-    while (clients_running > 0)
-        pthread_cond_wait(&clients_cv, &clients_mu);
-    pthread_mutex_unlock(&clients_mu);
-
-    close_device();
-
-    if (event_thread_started) {
-        running = 0;
-        pthread_join(event_thread, NULL);
-        event_thread_started = 0;
-    }
-
     unlink(BRIDGE_TOKEN_PATH);
-    libusb_exit(ctx);
     fprintf(stderr, "[bridge] Shutdown\n");
     return 0;
 }

@@ -10,8 +10,8 @@ XGecu only provides Windows software for their programmers. Existing Linux solut
 
 Two components:
 
-- **bridge_daemon**: Native Linux process that claims the USB device via libusb and listens on localhost. Proxies bulk USB transfers over TCP.
-- **winusb_bridge.c** (compiled to winusb.dll): Replaces WinUSB.dll inside Wine. Patches XGPro's import table at runtime to intercept device enumeration and USB I/O, then forwards everything to the daemon over TCP.
+- **bridge_daemon**: Native Linux process that enumerates XGecu programmers via libusb and listens on localhost. It forks one worker per shim connection, so each connection owns exactly one programmer and its libusb state stays private.
+- **winusb_bridge.c** (compiled to winusb.dll): Replaces WinUSB.dll inside Wine. Patches XGPro's import table at runtime to intercept device enumeration and USB I/O, opens one daemon connection per programmer, and forwards everything over TCP.
 
 XGPro thinks it's talking to a real Windows USB device. The programmer thinks it's talking to the Windows driver. Neither side knows anything unusual is happening.
 
@@ -69,6 +69,14 @@ For debug output:
 xgpro-bridge -v &
 XGPRO_DEBUG=1 WINEPREFIX=~/.wine-xgpro WINEDLLOVERRIDES="winusb=n" wine ~/.wine-xgpro/drive_c/Xgpro/Xgpro.exe
 ```
+
+## Multiple programmers
+
+Xgpro supports up to four programmers in one window. The bridge presents every
+programmer the daemon finds and opens one connection per device, so Xgpro's own
+`open_devices` fills `usb_handle[]`, `winusb_handle[]` and `devices_count`
+through its normal code path. No app internals are patched. Xgpro_T76 stays at
+one programmer, matching that app's own limit.
 
 ## Test-only fake devices
 

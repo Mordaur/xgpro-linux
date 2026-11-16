@@ -55,11 +55,8 @@ static DWORD pipe_timeout_ms[256];   /* PIPE_TRANSFER_TIMEOUT per pipe */
 static HWND  notify_hwnd = NULL;            /* window the app registered for WM_DEVICECHANGE */
 static GUID  notify_guid;                   /* interface GUID the app registered with */
 static BOOL  notify_guid_valid = FALSE;
-static char fake_dev_path[260];
 
 #define FAKE_HDEVINFO       ((HANDLE)(ULONG_PTR)0xDE000001)
-#define FAKE_FILE_HANDLE    ((HANDLE)(ULONG_PTR)0xCA000001)
-#define FAKE_WINUSB_HANDLE  ((void *)(ULONG_PTR)0xBE000001)
 
 static int profile_index_for_guid(const GUID *guid) {
     for (int i = 0; i < XGPRO_MODEL_COUNT; i++) {
@@ -74,18 +71,6 @@ static const xgpro_model_t *current_profile(void) {
     return &XGPRO_MODELS[selected_profile];
 }
 
-static const char *device_path(void) {
-    const xgpro_model_t *p = current_profile();
-    const xgpro_guid_t *g = &p->guid;
-
-    snprintf(fake_dev_path, sizeof(fake_dev_path),
-             "\\\\?\\USB#VID_A466&PID_%04X#%s#{%08lX-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X}",
-             p->pid, p->name,
-             (unsigned long)g->d1, g->d2, g->d3,
-             g->d4[0], g->d4[1], g->d4[2], g->d4[3],
-             g->d4[4], g->d4[5], g->d4[6], g->d4[7]);
-    return fake_dev_path;
-}
 
 static int is_verbose(void);
 static void dbg(const char *fmt, ...);
@@ -132,6 +117,16 @@ static HANDLE fake_handle(int idx)
 {
     return (HANDLE)(FAKE_HANDLE_BASE | (ULONG_PTR)idx);
 }
+
+#define REAL_HANDLE_BASE ((ULONG_PTR)0xF1000000)
+static int real_index_from_handle(HANDLE h)
+{
+    ULONG_PTR v = (ULONG_PTR)h;
+    if ((v & ~(ULONG_PTR)0xFF) == REAL_HANDLE_BASE)
+        return (int)(v & 0xFF);
+    return -1;
+}
+
 
 static const char *fake_device_path(int idx)
 {
@@ -211,17 +206,9 @@ static BOOL fake_read_pipe(int idx, UCHAR pipe, PUCHAR buf, ULONG len,
     return TRUE;
 }
 
-static SOCKET bridge_sock = INVALID_SOCKET;
 static int wsa_inited = 0;
 static CRITICAL_SECTION bridge_cs;
 static int debug_verbose = -1;
-
-static void bridge_disconnect(void) {
-    if (bridge_sock != INVALID_SOCKET) {
-        closesocket(bridge_sock);
-        bridge_sock = INVALID_SOCKET;
-    }
-}
 
 static int is_verbose(void) {
     if (debug_verbose < 0)
@@ -239,125 +226,300 @@ static void dbg(const char *fmt, ...) {
     fprintf(stderr, "[winusb] %s\n", buf);
 }
 
+/* ---------------------------------------------------------------------
+ * Connection layer.
+ *
+ * One TCP connection per device.  The daemon forks a worker per connection,
+ * so each worker owns exactly one programmer and its single-device state
+ * stays valid; multiple devices never share a libusb handle.  A short-lived
+ * control connection is used for enumeration, and the hotplug subscriber has
+ * its own connection.
+ * --------------------------------------------------------------------- */
+typedef struct {
+    SOCKET sock;
+    int    fake;          /* -1 = real device, >= 0 = test fake index */
+    int    index;         /* enumeration slot */
+    char   path[BRIDGE_PATH_LEN];
+} bridge_conn_t;
 
-static int bridge_send(const void *buf, int len);
-static int bridge_recv(void *buf, int len);
+typedef struct {
+    char     path[BRIDGE_PATH_LEN];
+    uint16_t pid;
+    int      fake;                   /* -1 = real, >= 0 = fake index */
+    char     product[64];
+} bridge_enum_t;
 
-static int bridge_connect(void) {
-    if (bridge_sock != INVALID_SOCKET) return 0;
+static bridge_enum_t enum_devs[BRIDGE_MAX_DEVICES];
+static volatile LONG enum_count = 0;
+static volatile LONG enum_valid = 0;
+
+static int sock_send_all(SOCKET s, const void *buf, int len)
+{
+    const char *p = (const char *)buf;
+    while (len > 0) {
+        int n = send(s, p, len, 0);
+        if (n <= 0) return -1;
+        p += n;
+        len -= n;
+    }
+    return 0;
+}
+
+static int sock_recv_all(SOCKET s, void *buf, int len)
+{
+    char *p = (char *)buf;
+    while (len > 0) {
+        int n = recv(s, p, len, 0);
+        if (n <= 0) return -1;
+        p += n;
+        len -= n;
+    }
+    return 0;
+}
+
+static SOCKET bridge_connect_raw(void)
+{
+    SOCKET s;
+    struct sockaddr_in addr;
+    uint8_t token[BRIDGE_TOKEN_LEN];
+    DWORD got = 0;
+    HANDLE hFile = INVALID_HANDLE_VALUE;
+    int tries;
 
     if (!wsa_inited) {
         WSADATA wsa;
         int err = WSAStartup(MAKEWORD(2, 2), &wsa);
         if (err != 0) {
             dbg("WSAStartup failed: %d", err);
-            return -1;
+            return INVALID_SOCKET;
         }
         wsa_inited = 1;
     }
 
-    bridge_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (bridge_sock == INVALID_SOCKET) {
+    s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (s == INVALID_SOCKET) {
         dbg("socket failed: %d", WSAGetLastError());
-        return -1;
+        return INVALID_SOCKET;
     }
-
     {
         int flag = 1;
-        setsockopt(bridge_sock, IPPROTO_TCP, TCP_NODELAY, (const char *)&flag, sizeof(flag));
-    }
-
-    {
+        setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (const char *)&flag, sizeof(flag));
         int bufsize = 256 * 1024;
-        setsockopt(bridge_sock, SOL_SOCKET, SO_RCVBUF, (const char *)&bufsize, sizeof(bufsize));
-        setsockopt(bridge_sock, SOL_SOCKET, SO_SNDBUF, (const char *)&bufsize, sizeof(bufsize));
+        setsockopt(s, SOL_SOCKET, SO_RCVBUF, (const char *)&bufsize, sizeof(bufsize));
+        setsockopt(s, SOL_SOCKET, SO_SNDBUF, (const char *)&bufsize, sizeof(bufsize));
     }
 
-    struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
     addr.sin_port = htons(BRIDGE_PORT);
     addr.sin_addr.s_addr = htonl(0x7f000001); /* 127.0.0.1 */
 
-    if (connect(bridge_sock, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
-        dbg("connect to bridge failed: %d", WSAGetLastError());
-        closesocket(bridge_sock);
-        bridge_sock = INVALID_SOCKET;
-        return -1;
+    /* The launcher starts the daemon just before the app; give it a moment. */
+    for (tries = 0; tries < 20; tries++) {
+        if (connect(s, (struct sockaddr *)&addr, sizeof(addr)) == 0)
+            break;
+        Sleep(100);
     }
-
+    if (tries == 20) {
+        dbg("connect to bridge failed: %d", WSAGetLastError());
+        closesocket(s);
+        return INVALID_SOCKET;
+    }
     dbg("Connected to bridge daemon on port %d", BRIDGE_PORT);
 
-    {
-        HANDLE hFile = CreateFileA(BRIDGE_TOKEN_PATH_WINE, GENERIC_READ, FILE_SHARE_READ,
-                                   NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-        if (hFile == INVALID_HANDLE_VALUE) {
-            dbg("Failed to open token file: %s (err=%d)", BRIDGE_TOKEN_PATH_WINE, (int)GetLastError());
-            closesocket(bridge_sock);
-            bridge_sock = INVALID_SOCKET;
-            return -1;
-        }
-        uint8_t token[BRIDGE_TOKEN_LEN];
-        DWORD bytes_read = 0;
-        BOOL ok = ReadFile(hFile, token, BRIDGE_TOKEN_LEN, &bytes_read, NULL);
+    hFile = CreateFileA(BRIDGE_TOKEN_PATH_WINE, GENERIC_READ, FILE_SHARE_READ,
+                        NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hFile == INVALID_HANDLE_VALUE) {
+        dbg("Failed to open token file: %s (err=%d)", BRIDGE_TOKEN_PATH_WINE, (int)GetLastError());
+        closesocket(s);
+        return INVALID_SOCKET;
+    }
+    if (!ReadFile(hFile, token, BRIDGE_TOKEN_LEN, &got, NULL) ||
+        got != BRIDGE_TOKEN_LEN) {
+        dbg("Failed to read token file (read %u bytes)", (unsigned)got);
         CloseHandle(hFile);
-        if (!ok || bytes_read != BRIDGE_TOKEN_LEN) {
-            dbg("Failed to read token file (read %u bytes)", (unsigned)bytes_read);
-            closesocket(bridge_sock);
-            bridge_sock = INVALID_SOCKET;
-            return -1;
-        }
-        if (bridge_send(token, BRIDGE_TOKEN_LEN) < 0) {
-            dbg("Failed to send auth token");
-            bridge_disconnect();
-            return -1;
-        }
-        dbg("Auth token sent to bridge daemon");
+        closesocket(s);
+        return INVALID_SOCKET;
     }
-
-    {
-        bridge_request_t hreq = { CMD_HELLO, 0, 0 };
-        bridge_hello_t hello;
-        bridge_response_t resp = { 0, 0 };
-        hello.version = BRIDGE_PROTO_VERSION;
-        hello.pid = (selected_profile >= 0) ? XGPRO_MODELS[selected_profile].pid : 0;
-        if (bridge_send(&hreq, sizeof(hreq)) < 0 ||
-            bridge_send(&hello, sizeof(hello)) < 0 ||
-            bridge_recv(&resp, sizeof(resp)) < 0 || resp.status != 0) {
-            dbg("Bridge rejected protocol v%u / PID %04x (status %d, daemon v%u)",
-                hello.version, hello.pid, resp.status, resp.length);
-            bridge_disconnect();
-            SetLastError(ERROR_REVISION_MISMATCH);
-            return -1;
-        }
-        dbg("Bridge protocol v%u, requested PID %04x", hello.version, hello.pid);
+    CloseHandle(hFile);
+    if (sock_send_all(s, token, BRIDGE_TOKEN_LEN) < 0) {
+        dbg("Failed to send auth token");
+        closesocket(s);
+        return INVALID_SOCKET;
     }
+    dbg("Auth token sent to bridge daemon");
+    return s;
+}
 
+static int bridge_hello_sock(SOCKET s, uint16_t pid)
+{
+    bridge_request_t hreq = { CMD_HELLO, 0, 0 };
+    bridge_hello_t hello;
+    bridge_response_t resp = { 0, 0 };
+
+    hello.version = BRIDGE_PROTO_VERSION;
+    hello.pid = pid;
+    if (sock_send_all(s, &hreq, sizeof(hreq)) < 0 ||
+        sock_send_all(s, &hello, sizeof(hello)) < 0 ||
+        sock_recv_all(s, &resp, sizeof(resp)) < 0 || resp.status != 0) {
+        dbg("Bridge rejected protocol v%u / PID %04x (status %d, daemon v%u)",
+            hello.version, hello.pid, resp.status, resp.length);
+        SetLastError(ERROR_REVISION_MISMATCH);
+        return -1;
+    }
+    dbg("Bridge protocol v%u, requested PID %04x", hello.version, hello.pid);
     return 0;
 }
 
-static int bridge_send(const void *buf, int len) {
-    const char *p = (const char *)buf;
-    while (len > 0) {
-        int n = send(bridge_sock, p, len, 0);
-        if (n <= 0) { bridge_disconnect(); return -1; }
-        p += n;
-        len -= n;
+static SOCKET bridge_connect_control(uint16_t pid)
+{
+    SOCKET s = bridge_connect_raw();
+    if (s == INVALID_SOCKET) return INVALID_SOCKET;
+    if (bridge_hello_sock(s, pid) < 0) {
+        closesocket(s);
+        return INVALID_SOCKET;
     }
+    return s;
+}
+
+static int bridge_enumerate(void)
+{
+    uint16_t pid = (selected_profile >= 0) ? XGPRO_MODELS[selected_profile].pid : 0;
+    SOCKET s = bridge_connect_control(pid);
+    bridge_request_t req = { CMD_ENUMERATE, 0, 0 };
+    bridge_response_t resp = { 0, 0 };
+    uint32_t count = 0, i;
+    int n = 0, target;
+
+    if (s == INVALID_SOCKET) {
+        dbg("enumeration: no control connection");
+        return -1;
+    }
+    if (sock_send_all(s, &req, sizeof(req)) < 0 ||
+        sock_recv_all(s, &resp, sizeof(resp)) < 0 || resp.status != 0 ||
+        sock_recv_all(s, &count, sizeof(count)) < 0) {
+        dbg("enumeration failed");
+        closesocket(s);
+        return -1;
+    }
+    if (count > BRIDGE_MAX_DEVICES) count = BRIDGE_MAX_DEVICES;
+    for (i = 0; i < count; i++) {
+        bridge_dev_info_t d;
+        if (sock_recv_all(s, &d, sizeof(d)) < 0) break;
+        if (pid && d.pid != pid) continue;
+        if (n >= BRIDGE_MAX_DEVICES) continue;
+        memset(&enum_devs[n], 0, sizeof(enum_devs[n]));
+        snprintf(enum_devs[n].path, sizeof(enum_devs[n].path), "%s", d.path);
+        snprintf(enum_devs[n].product, sizeof(enum_devs[n].product), "%s", d.product);
+        enum_devs[n].pid = d.pid;
+        enum_devs[n].fake = -1;
+        dbg("enumeration: %s at %s (PID %04x)", d.product, d.path, d.pid);
+        n++;
+    }
+    closesocket(s);
+
+    /* TEST-ONLY: top the list up with fakes so XGPRO_FAKE_DEVICES=N presents
+     * N programmers.  The fakes are local to the shim and never touch the
+     * daemon or libusb. */
+    target = fake_total();
+    while (target > 1 && n < target && n < BRIDGE_MAX_DEVICES) {
+        int fi = n;
+        memset(&enum_devs[n], 0, sizeof(enum_devs[n]));
+        snprintf(enum_devs[n].path, sizeof(enum_devs[n].path), "FAKE%d", fi);
+        snprintf(enum_devs[n].product, sizeof(enum_devs[n].product), "FAKE%d (test)", fi);
+        enum_devs[n].pid = pid;
+        enum_devs[n].fake = fi;
+        dbg("enumeration: TEST fake %d", fi);
+        n++;
+    }
+
+    enum_count = n;
+    InterlockedExchange(&enum_valid, 1);
+    dbg("enumeration: %d device(s)", n);
     return 0;
 }
 
-static int bridge_recv(void *buf, int len) {
-    char *p = (char *)buf;
-    while (len > 0) {
-        int n = recv(bridge_sock, p, len, 0);
-        if (n <= 0) { bridge_disconnect(); return -1; }
-        p += n;
-        len -= n;
+static SOCKET bridge_open_session(const char *path, uint16_t pid)
+{
+    SOCKET s = bridge_connect_control(pid);
+    bridge_request_t req = { CMD_OPEN, 0, 0 };
+    bridge_open_t open;
+    bridge_response_t resp = { 0, 0 };
+
+    if (s == INVALID_SOCKET) return INVALID_SOCKET;
+    memset(&open, 0, sizeof(open));
+    if (path) strncpy(open.path, path, sizeof(open.path) - 1);
+    if (sock_send_all(s, &req, sizeof(req)) < 0 ||
+        sock_send_all(s, &open, sizeof(open)) < 0 ||
+        sock_recv_all(s, &resp, sizeof(resp)) < 0 || resp.status != 0) {
+        dbg("CMD_OPEN %s failed (status %d)", path ? path : "", resp.status);
+        closesocket(s);
+        return INVALID_SOCKET;
     }
-    return 0;
+    return s;
 }
 
+static void bridge_close_session(bridge_conn_t *c)
+{
+    if (!c) return;
+    if (c->sock != INVALID_SOCKET) {
+        bridge_request_t req = { CMD_CLOSE, 0, 0 };
+        bridge_response_t resp;
+        if (sock_send_all(c->sock, &req, sizeof(req)) == 0)
+            sock_recv_all(c->sock, &resp, sizeof(resp));
+        closesocket(c->sock);
+    }
+    free(c);
+}
+
+static void session_drop(bridge_conn_t *c)
+{
+    if (c && c->sock != INVALID_SOCKET) {
+        closesocket(c->sock);
+        c->sock = INVALID_SOCKET;
+    }
+}
+
+
+static const char *real_device_path(int idx)
+{
+    static char buf[260];
+    const xgpro_model_t *p = current_profile();
+    const xgpro_guid_t *g = &p->guid;
+    char token[BRIDGE_PATH_LEN];
+    int i;
+
+    snprintf(token, sizeof(token), "%s",
+             (idx >= 0 && idx < (int)enum_count) ? enum_devs[idx].path : "");
+    for (i = 0; token[i]; i++)
+        if (token[i] == ':') token[i] = '-';
+
+    snprintf(buf, sizeof(buf),
+             "\\\\?\\USB#VID_A466&PID_%04X#XGPRO-%s#{%08lX-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X}",
+             p->pid, token,
+             (unsigned long)g->d1, g->d2, g->d3,
+             g->d4[0], g->d4[1], g->d4[2], g->d4[3],
+             g->d4[4], g->d4[5], g->d4[6], g->d4[7]);
+    return buf;
+}
+
+static int enum_index_for_path(const char *upper)
+{
+    for (int i = 0; i < (int)enum_count; i++) {
+        char token[BRIDGE_PATH_LEN], pat[BRIDGE_PATH_LEN + 16];
+        char *q;
+        if (enum_devs[i].fake >= 0)
+            continue;
+        strncpy(token, enum_devs[i].path, sizeof(token) - 1);
+        token[sizeof(token) - 1] = '\0';
+        for (q = token; *q; q++)
+            if (*q == ':') *q = '-';
+        snprintf(pat, sizeof(pat), "XGPRO-%s", token);
+        if (strstr(upper, pat))
+            return i;
+    }
+    return -1;
+}
 
 static HANDLE WINAPI my_SetupDiGetClassDevsA(
     const GUID *ClassGuid, const char *Enumerator, HWND hwndParent, DWORD Flags)
@@ -366,8 +528,11 @@ static HANDLE WINAPI my_SetupDiGetClassDevsA(
         int idx = profile_index_for_guid(ClassGuid);
         if (idx >= 0) {
             selected_profile = idx;
-            dbg("SetupDiGetClassDevsA: matched %s GUID -> returning fake HDEVINFO",
-                XGPRO_MODELS[idx].name);
+            EnterCriticalSection(&bridge_cs);
+            bridge_enumerate();
+            LeaveCriticalSection(&bridge_cs);
+            dbg("SetupDiGetClassDevsA: matched %s GUID -> %d device(s)",
+                XGPRO_MODELS[idx].name, (int)enum_count);
             return FAKE_HDEVINFO;
         }
     }
@@ -382,9 +547,10 @@ static BOOL WINAPI my_SetupDiEnumDeviceInterfaces(
     MY_SP_DEVICE_INTERFACE_DATA *DeviceInterfaceData)
 {
     if (DeviceInfoSet == FAKE_HDEVINFO &&
-        MemberIndex < (DWORD)fake_total()) {
+        MemberIndex < (DWORD)enum_count) {
         dbg("SetupDiEnumDeviceInterfaces: returning %s at index %lu",
-            MemberIndex == 0 ? current_profile()->name : "FAKE",
+            enum_devs[MemberIndex].fake >= 0 ? "FAKE" :
+                enum_devs[MemberIndex].product,
             (unsigned long)MemberIndex);
         if (DeviceInterfaceData) {
             DeviceInterfaceData->cbSize = sizeof(MY_SP_DEVICE_INTERFACE_DATA);
@@ -408,7 +574,13 @@ static BOOL WINAPI my_SetupDiGetDeviceInterfaceDetailA(
     DWORD *RequiredSize, void *DeviceInfoData)
 {
     DWORD idx = InterfaceData ? (DWORD)InterfaceData->Reserved : 0;
-    const char *path = (idx == 0) ? device_path() : fake_device_path((int)idx);
+    const char *path;
+    if (idx < (DWORD)enum_count && enum_devs[idx].fake >= 0)
+        path = fake_device_path(enum_devs[idx].fake);
+    else if (idx < (DWORD)enum_count)
+        path = real_device_path((int)idx);
+    else
+        path = fake_device_path(0);
     DWORD needed = offsetof(MY_SP_DEVICE_INTERFACE_DETAIL_DATA_A, DevicePath) +
                    strlen(path) + 1;
     dbg("SetupDiGetDeviceInterfaceDetailA: needed=%u provided=%u", needed, DetailDataSize);
@@ -454,8 +626,15 @@ static HANDLE WINAPI my_CreateFileA(
                     return fake_handle(idx);
                 }
             }
-            dbg("CreateFileA: intercepted XGecu device open -> fake handle");
-            return FAKE_FILE_HANDLE;
+            {
+                int i = enum_index_for_path(upper);
+                if (i >= 0) {
+                    dbg("CreateFileA: real device index %d", i);
+                    return (HANDLE)(REAL_HANDLE_BASE | (ULONG_PTR)i);
+                }
+            }
+            dbg("CreateFileA: unparsed XGecu path -> index 0");
+            return (HANDLE)(REAL_HANDLE_BASE | 0);
         }
     }
     if (!orig_CreateFileA) {
@@ -495,8 +674,15 @@ static HANDLE WINAPI my_CreateFileW(
                         return fake_handle(idx);
                     }
                 }
-                dbg("CreateFileW: intercepted XGecu device open -> fake handle");
-                return FAKE_FILE_HANDLE;
+                {
+                    int i = enum_index_for_path(ansi);
+                    if (i >= 0) {
+                        dbg("CreateFileW: real device index %d", i);
+                        return (HANDLE)(REAL_HANDLE_BASE | (ULONG_PTR)i);
+                    }
+                }
+                dbg("CreateFileW: unparsed XGecu path -> index 0");
+                return (HANDLE)(REAL_HANDLE_BASE | 0);
             }
         }
     }
@@ -709,17 +895,6 @@ static HDEVNOTIFY WINAPI my_RegisterDeviceNotificationA(
     return (HDEVNOTIFY)(ULONG_PTR)0xDB000001;
 }
 
-static int sub_recv_all(SOCKET s, void *buf, int len)
-{
-    char *p = (char *)buf;
-    while (len > 0) {
-        int n = recv(s, p, len, 0);
-        if (n <= 0) return -1;
-        p += n;
-        len -= n;
-    }
-    return 0;
-}
 
 /* Subscribe to the daemon's libusb hotplug feed and replay the real
  * attach/detach events to the window the app registered. Nothing is
@@ -760,6 +935,12 @@ static DWORD WINAPI subscriber_thread(LPVOID unused)
         return 0;
     }
 
+    if (bridge_hello_sock(s, (selected_profile >= 0) ?
+                              XGPRO_MODELS[selected_profile].pid : 0) < 0) {
+        closesocket(s);
+        return 0;
+    }
+
     ZeroMemory(&req, sizeof(req));
     req.cmd = CMD_SUBSCRIBE;
     if (send(s, (const char *)&req, sizeof(req), 0) != sizeof(req)) {
@@ -772,13 +953,14 @@ static DWORD WINAPI subscriber_thread(LPVOID unused)
         bridge_event_t ev;
         DEV_BROADCAST_DEVICEINTERFACE_W bi;
 
-        if (sub_recv_all(s, &ev, sizeof(ev)) < 0) break;
+        if (sock_recv_all(s, &ev, sizeof(ev)) < 0) break;
 
         ZeroMemory(&bi, sizeof(bi));
         bi.dbcc_size = sizeof(bi);
         bi.dbcc_devicetype = DBT_DEVTYP_DEVICEINTERFACE;
         if (notify_guid_valid) bi.dbcc_classguid = notify_guid;
 
+        InterlockedExchange(&enum_valid, 0);
         dbg("hardware event: %s pid=%04x", ev.evt ? "arrived" : "removed", ev.pid);
         if (notify_hwnd) {
             SendMessageW(notify_hwnd, WM_DEVICECHANGE,
@@ -834,59 +1016,75 @@ static void install_hooks(void) {
 __declspec(dllexport) BOOL __stdcall WinUsb_Initialize(
     HANDLE DeviceHandle, void **InterfaceHandle)
 {
-    dbg("WinUsb_Initialize");
+    int fi = fake_index_from_handle(DeviceHandle);
+    int ri = real_index_from_handle(DeviceHandle);
+    bridge_conn_t *c;
+    uint16_t pid = (selected_profile >= 0) ? XGPRO_MODELS[selected_profile].pid : 0;
+    const char *path = "";
 
-    {
-        int fi = fake_index_from_handle(DeviceHandle);
-        if (fi >= 0) {
-            dbg("  -> TEST fake device %d", fi);
-            if (InterfaceHandle) *InterfaceHandle = DeviceHandle;
+    dbg("WinUsb_Initialize");
+    if (!InterfaceHandle) { SetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
+
+    c = (bridge_conn_t *)calloc(1, sizeof(*c));
+    if (!c) { SetLastError(ERROR_NOT_ENOUGH_MEMORY); return FALSE; }
+    c->sock = INVALID_SOCKET;
+    c->fake = -1;
+
+    if (fi >= 0) {
+        dbg("  -> TEST fake device %d", fi);
+        c->fake = fi;
+        c->index = fi;
+        *InterfaceHandle = c;
+        return TRUE;
+    }
+
+    if (!enum_valid) {
+        EnterCriticalSection(&bridge_cs);
+        if (!enum_valid) bridge_enumerate();
+        LeaveCriticalSection(&bridge_cs);
+    }
+
+    if (ri < 0) ri = 0;
+    if (ri < (int)enum_count) {
+        if (enum_devs[ri].fake >= 0) {
+            dbg("  -> TEST fake device %d (enumerated)", enum_devs[ri].fake);
+            c->fake = enum_devs[ri].fake;
+            c->index = ri;
+            *InterfaceHandle = c;
             return TRUE;
         }
+        path = enum_devs[ri].path;
+        pid = enum_devs[ri].pid;
+        c->index = ri;
+        snprintf(c->path, sizeof(c->path), "%s", path);
+    } else if (enum_count > 0) {
+        dbg("  -> handle index %d has no enumerated device", ri);
+        free(c);
+        SetLastError(ERROR_DEVICE_NOT_CONNECTED);
+        return FALSE;
     }
 
     EnterCriticalSection(&bridge_cs);
-    if (bridge_connect() < 0) {
-        dbg("  -> failed to connect to bridge");
-        LeaveCriticalSection(&bridge_cs);
-        SetLastError(ERROR_GEN_FAILURE);
-        return FALSE;
-    }
-
-    bridge_request_t req = { CMD_OPEN, 0, 0 };
-    if (bridge_send(&req, sizeof(req)) < 0) {
-        LeaveCriticalSection(&bridge_cs);
-        SetLastError(ERROR_GEN_FAILURE);
-        return FALSE;
-    }
-
-    bridge_response_t resp;
-    if (bridge_recv(&resp, sizeof(resp)) < 0 || resp.status != 0) {
-        dbg("  -> bridge open failed: %d", resp.status);
-        LeaveCriticalSection(&bridge_cs);
-        SetLastError(ERROR_GEN_FAILURE);
-        return FALSE;
-    }
+    c->sock = bridge_open_session(path, pid);
     LeaveCriticalSection(&bridge_cs);
-
-    if (InterfaceHandle) *InterfaceHandle = FAKE_WINUSB_HANDLE;
-    dbg("  -> success");
+    if (c->sock == INVALID_SOCKET) {
+        dbg("  -> bridge open failed for %s", path[0] ? path : "(first match)");
+        free(c);
+        SetLastError(ERROR_GEN_FAILURE);
+        return FALSE;
+    }
+    dbg("  -> opened %s", path[0] ? path : "(first match)");
+    *InterfaceHandle = c;
     return TRUE;
 }
 
 __declspec(dllexport) BOOL __stdcall WinUsb_Free(void *InterfaceHandle) {
+    bridge_conn_t *c = (bridge_conn_t *)InterfaceHandle;
     dbg("WinUsb_Free");
-    if (fake_index_from_handle((HANDLE)InterfaceHandle) >= 0)
+    if (!c)
         return TRUE;
     EnterCriticalSection(&bridge_cs);
-    if (bridge_sock != INVALID_SOCKET) {
-        bridge_request_t req = { CMD_CLOSE, 0, 0 };
-        bridge_send(&req, sizeof(req));
-        bridge_response_t resp;
-        bridge_recv(&resp, sizeof(resp));
-        closesocket(bridge_sock);
-        bridge_sock = INVALID_SOCKET;
-    }
+    bridge_close_session(c);
     LeaveCriticalSection(&bridge_cs);
     return TRUE;
 }
@@ -906,7 +1104,7 @@ static void complete_overlapped(void *Overlapped, BOOL ok, DWORD transferred)
     if (ov->hEvent) SetEvent(ov->hEvent);
 }
 
-static BOOL write_pipe(UCHAR PipeID, PUCHAR Buffer, ULONG BufferLength, PULONG LengthTransferred)
+static BOOL write_pipe(bridge_conn_t *c, UCHAR PipeID, PUCHAR Buffer, ULONG BufferLength, PULONG LengthTransferred)
 {
     if (is_verbose()) {
         char hex[128] = {0};
@@ -917,26 +1115,29 @@ static BOOL write_pipe(UCHAR PipeID, PUCHAR Buffer, ULONG BufferLength, PULONG L
     }
 
     EnterCriticalSection(&bridge_cs);
-    if (bridge_sock == INVALID_SOCKET) {
+    if (!c || c->sock == INVALID_SOCKET) {
         LeaveCriticalSection(&bridge_cs);
         SetLastError(ERROR_GEN_FAILURE);
         return FALSE;
     }
 
     bridge_request_t req = { CMD_WRITE_PIPE, PipeID, BufferLength, pipe_timeout_ms[PipeID] };
-    if (bridge_send(&req, sizeof(req)) < 0) {
+    if (sock_send_all(c->sock, &req, sizeof(req)) < 0) {
+        session_drop(c);
         LeaveCriticalSection(&bridge_cs);
         SetLastError(ERROR_GEN_FAILURE);
         return FALSE;
     }
-    if (BufferLength > 0 && bridge_send(Buffer, BufferLength) < 0) {
+    if (BufferLength > 0 && sock_send_all(c->sock, Buffer, BufferLength) < 0) {
+        session_drop(c);
         LeaveCriticalSection(&bridge_cs);
         SetLastError(ERROR_GEN_FAILURE);
         return FALSE;
     }
 
     bridge_response_t resp;
-    if (bridge_recv(&resp, sizeof(resp)) < 0) {
+    if (sock_recv_all(c->sock, &resp, sizeof(resp)) < 0) {
+        session_drop(c);
         LeaveCriticalSection(&bridge_cs);
         SetLastError(ERROR_GEN_FAILURE);
         return FALSE;
@@ -948,27 +1149,29 @@ static BOOL write_pipe(UCHAR PipeID, PUCHAR Buffer, ULONG BufferLength, PULONG L
     return TRUE;
 }
 
-static BOOL read_pipe(UCHAR PipeID, PUCHAR Buffer, ULONG BufferLength, PULONG LengthTransferred)
+static BOOL read_pipe(bridge_conn_t *c, UCHAR PipeID, PUCHAR Buffer, ULONG BufferLength, PULONG LengthTransferred)
 {
     if (is_verbose())
         dbg("WinUsb_ReadPipe pipe=0x%02x len=%u", PipeID, BufferLength);
 
     EnterCriticalSection(&bridge_cs);
-    if (bridge_sock == INVALID_SOCKET) {
+    if (!c || c->sock == INVALID_SOCKET) {
         LeaveCriticalSection(&bridge_cs);
         SetLastError(ERROR_GEN_FAILURE);
         return FALSE;
     }
 
     bridge_request_t req = { CMD_READ_PIPE, PipeID, BufferLength, pipe_timeout_ms[PipeID] };
-    if (bridge_send(&req, sizeof(req)) < 0) {
+    if (sock_send_all(c->sock, &req, sizeof(req)) < 0) {
+        session_drop(c);
         LeaveCriticalSection(&bridge_cs);
         SetLastError(ERROR_GEN_FAILURE);
         return FALSE;
     }
 
     bridge_response_t resp;
-    if (bridge_recv(&resp, sizeof(resp)) < 0) {
+    if (sock_recv_all(c->sock, &resp, sizeof(resp)) < 0) {
+        session_drop(c);
         LeaveCriticalSection(&bridge_cs);
         SetLastError(ERROR_GEN_FAILURE);
         return FALSE;
@@ -976,7 +1179,7 @@ static BOOL read_pipe(UCHAR PipeID, PUCHAR Buffer, ULONG BufferLength, PULONG Le
 
     if (resp.length > MAX_TRANSFER_LEN) {
         dbg("WinUsb_ReadPipe: resp.length %u exceeds max, disconnecting", resp.length);
-        bridge_disconnect();
+        session_drop(c);
         LeaveCriticalSection(&bridge_cs);
         SetLastError(ERROR_GEN_FAILURE);
         return FALSE;
@@ -989,7 +1192,8 @@ static BOOL read_pipe(UCHAR PipeID, PUCHAR Buffer, ULONG BufferLength, PULONG Le
     }
 
     if (resp.length > 0 && Buffer) {
-        if (bridge_recv(Buffer, resp.length) < 0) {
+        if (sock_recv_all(c->sock, Buffer, resp.length) < 0) {
+            session_drop(c);
             LeaveCriticalSection(&bridge_cs);
             SetLastError(ERROR_GEN_FAILURE);
             return FALSE;
@@ -1009,7 +1213,8 @@ static BOOL read_pipe(UCHAR PipeID, PUCHAR Buffer, ULONG BufferLength, PULONG Le
         char discard[4096];
         while (remain > 0) {
             uint32_t chunk = remain < sizeof(discard) ? remain : sizeof(discard);
-            if (bridge_recv(discard, chunk) < 0) {
+            if (sock_recv_all(c->sock, discard, chunk) < 0) {
+                session_drop(c);
                 LeaveCriticalSection(&bridge_cs);
                 SetLastError(ERROR_GEN_FAILURE);
                 return FALSE;
@@ -1028,10 +1233,10 @@ __declspec(dllexport) BOOL __stdcall WinUsb_WritePipe(
     void *InterfaceHandle, UCHAR PipeID,
     PUCHAR Buffer, ULONG BufferLength, PULONG LengthTransferred, void *Overlapped)
 {
-    int fi = fake_index_from_handle((HANDLE)InterfaceHandle);
-    BOOL ok = (fi >= 0) ?
-        fake_write_pipe(fi, PipeID, Buffer, BufferLength, LengthTransferred) :
-        write_pipe(PipeID, Buffer, BufferLength, LengthTransferred);
+    bridge_conn_t *c = (bridge_conn_t *)InterfaceHandle;
+    BOOL ok = (c && c->fake >= 0) ?
+        fake_write_pipe(c->fake, PipeID, Buffer, BufferLength, LengthTransferred) :
+        write_pipe(c, PipeID, Buffer, BufferLength, LengthTransferred);
     complete_overlapped(Overlapped, ok, (ok && LengthTransferred) ? *LengthTransferred : 0);
     return ok;
 }
@@ -1040,10 +1245,10 @@ __declspec(dllexport) BOOL __stdcall WinUsb_ReadPipe(
     void *InterfaceHandle, UCHAR PipeID,
     PUCHAR Buffer, ULONG BufferLength, PULONG LengthTransferred, void *Overlapped)
 {
-    int fi = fake_index_from_handle((HANDLE)InterfaceHandle);
-    BOOL ok = (fi >= 0) ?
-        fake_read_pipe(fi, PipeID, Buffer, BufferLength, LengthTransferred) :
-        read_pipe(PipeID, Buffer, BufferLength, LengthTransferred);
+    bridge_conn_t *c = (bridge_conn_t *)InterfaceHandle;
+    BOOL ok = (c && c->fake >= 0) ?
+        fake_read_pipe(c->fake, PipeID, Buffer, BufferLength, LengthTransferred) :
+        read_pipe(c, PipeID, Buffer, BufferLength, LengthTransferred);
     complete_overlapped(Overlapped, ok, (ok && LengthTransferred) ? *LengthTransferred : 0);
     return ok;
 }
@@ -1051,7 +1256,8 @@ __declspec(dllexport) BOOL __stdcall WinUsb_ReadPipe(
 __declspec(dllexport) BOOL __stdcall WinUsb_SetPipePolicy(
     void *InterfaceHandle, UCHAR PipeID, ULONG PolicyType, ULONG ValueLength, void *Value)
 {
-    if (fake_index_from_handle((HANDLE)InterfaceHandle) >= 0)
+    bridge_conn_t *c = (bridge_conn_t *)InterfaceHandle;
+    if (!c || c->fake >= 0)
         return TRUE;
     if (is_verbose())
         dbg("WinUsb_SetPipePolicy pipe=0x%02x policy=%u", PipeID, PolicyType);
@@ -1065,52 +1271,51 @@ __declspec(dllexport) BOOL __stdcall WinUsb_SetPipePolicy(
     }
 
     EnterCriticalSection(&bridge_cs);
-    if (bridge_sock == INVALID_SOCKET) {
-        LeaveCriticalSection(&bridge_cs);
-        return TRUE;
+    if (c->sock != INVALID_SOCKET) {
+        bridge_request_t req = { CMD_SET_PIPE_POLICY, PipeID, PolicyType };
+        if (sock_send_all(c->sock, &req, sizeof(req)) == 0) {
+            bridge_response_t resp;
+            sock_recv_all(c->sock, &resp, sizeof(resp));
+        }
     }
-    bridge_request_t req = { CMD_SET_PIPE_POLICY, PipeID, PolicyType };
-    bridge_send(&req, sizeof(req));
-    bridge_response_t resp;
-    bridge_recv(&resp, sizeof(resp));
     LeaveCriticalSection(&bridge_cs);
     return TRUE;
 }
 
 __declspec(dllexport) BOOL __stdcall WinUsb_FlushPipe(void *InterfaceHandle, UCHAR PipeID) {
-    if (fake_index_from_handle((HANDLE)InterfaceHandle) >= 0)
+    bridge_conn_t *c = (bridge_conn_t *)InterfaceHandle;
+    if (!c || c->fake >= 0)
         return TRUE;
     if (is_verbose())
         dbg("WinUsb_FlushPipe 0x%02x", PipeID);
 
     EnterCriticalSection(&bridge_cs);
-    if (bridge_sock == INVALID_SOCKET) {
-        LeaveCriticalSection(&bridge_cs);
-        return TRUE;
+    if (c->sock != INVALID_SOCKET) {
+        bridge_request_t req = { CMD_FLUSH_PIPE, PipeID, 0 };
+        if (sock_send_all(c->sock, &req, sizeof(req)) == 0) {
+            bridge_response_t resp;
+            sock_recv_all(c->sock, &resp, sizeof(resp));
+        }
     }
-    bridge_request_t req = { CMD_FLUSH_PIPE, PipeID, 0 };
-    bridge_send(&req, sizeof(req));
-    bridge_response_t resp;
-    bridge_recv(&resp, sizeof(resp));
     LeaveCriticalSection(&bridge_cs);
     return TRUE;
 }
 
 __declspec(dllexport) BOOL __stdcall WinUsb_AbortPipe(void *InterfaceHandle, UCHAR PipeID) {
-    if (fake_index_from_handle((HANDLE)InterfaceHandle) >= 0)
+    bridge_conn_t *c = (bridge_conn_t *)InterfaceHandle;
+    if (!c || c->fake >= 0)
         return TRUE;
     if (is_verbose())
         dbg("WinUsb_AbortPipe 0x%02x", PipeID);
 
     EnterCriticalSection(&bridge_cs);
-    if (bridge_sock == INVALID_SOCKET) {
-        LeaveCriticalSection(&bridge_cs);
-        return TRUE;
+    if (c->sock != INVALID_SOCKET) {
+        bridge_request_t req = { CMD_ABORT_PIPE, PipeID, 0 };
+        if (sock_send_all(c->sock, &req, sizeof(req)) == 0) {
+            bridge_response_t resp;
+            sock_recv_all(c->sock, &resp, sizeof(resp));
+        }
     }
-    bridge_request_t req = { CMD_ABORT_PIPE, PipeID, 0 };
-    bridge_send(&req, sizeof(req));
-    bridge_response_t resp;
-    bridge_recv(&resp, sizeof(resp));
     LeaveCriticalSection(&bridge_cs);
     return TRUE;
 }
