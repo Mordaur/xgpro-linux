@@ -70,6 +70,26 @@ xgpro-bridge -v &
 XGPRO_DEBUG=1 WINEPREFIX=~/.wine-xgpro WINEDLLOVERRIDES="winusb=n" wine ~/.wine-xgpro/drive_c/Xgpro/Xgpro.exe
 ```
 
+## Test-only fake devices
+
+To exercise Xgpro's own multi-programmer table without several physical
+programmers:
+
+```
+XGPRO_FAKE_DEVICES=4 XGPRO_DEBUG=1 ~/xgpro.sh
+```
+
+Entry 1 is the real programmer; entries 2-4 (`FAKE1..3`) answer only the
+device-info request, using the same 41-byte layout as a real TL866II+ with the
+identity fields replaced. They never return chip data and never touch libusb.
+This tests enumeration, per-handle routing and the app's
+`usb_handle[]`/`winusb_handle[]`/`devices_count`, **not** real hardware
+behaviour. The mode is off unless the variable is set and logs `TEST MODE`.
+
+`XGPRO_DUMP_UI=1` also dumps the app's status bar and list counts from inside
+the process after startup, which is useful when the desktop is headless or
+locked.
+
 ## What works
 
 - Everything just like on the official software.

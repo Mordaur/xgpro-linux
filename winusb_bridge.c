@@ -12,6 +12,7 @@
 #include <dbt.h>
 #include <wininet.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -84,6 +85,130 @@ static const char *device_path(void) {
              g->d4[0], g->d4[1], g->d4[2], g->d4[3],
              g->d4[4], g->d4[5], g->d4[6], g->d4[7]);
     return fake_dev_path;
+}
+
+static int is_verbose(void);
+static void dbg(const char *fmt, ...);
+
+/* ---------------------------------------------------------------------
+ * TEST-ONLY fake devices.
+ *
+ * XGPRO_FAKE_DEVICES=N (1..4) makes SetupDi present the real programmer plus
+ * N-1 synthetic ones, so the app's own multi-device table and enumeration loop
+ * can be exercised without owning several programmers.  The fakes answer only
+ * the device-info exchange and return zeros otherwise; they are named FAKE*,
+ * never touch libusb, and are off by default.  This is a plumbing test, not
+ * evidence about real hardware.
+ * --------------------------------------------------------------------- */
+#define FAKE_HANDLE_BASE ((ULONG_PTR)0xF0000000)
+#define FAKE_MAX 4
+static int fake_total_cached = -1;
+static volatile int fake_info_pending[FAKE_MAX];
+
+static int fake_total(void)
+{
+    if (fake_total_cached < 0) {
+        const char *e = getenv("XGPRO_FAKE_DEVICES");
+        int n = e ? atoi(e) : 1;
+        if (n < 1) n = 1;
+        if (n > FAKE_MAX) n = FAKE_MAX;
+        fake_total_cached = n;
+        if (n > 1)
+            fprintf(stderr, "[winusb] TEST MODE: %d devices (%d fake), "
+                            "no hardware data from the fakes\n", n, n - 1);
+    }
+    return fake_total_cached;
+}
+
+static int fake_index_from_handle(HANDLE h)
+{
+    ULONG_PTR v = (ULONG_PTR)h;
+    if ((v & ~(ULONG_PTR)0xFF) == FAKE_HANDLE_BASE)
+        return (int)(v & 0xFF);
+    return -1;
+}
+
+static HANDLE fake_handle(int idx)
+{
+    return (HANDLE)(FAKE_HANDLE_BASE | (ULONG_PTR)idx);
+}
+
+static const char *fake_device_path(int idx)
+{
+    static char buf[260];
+    const xgpro_model_t *p = current_profile();
+    const xgpro_guid_t *g = &p->guid;
+
+    snprintf(buf, sizeof(buf),
+             "\\\\?\\USB#VID_A466&PID_%04X#FAKE%d#{%08lX-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X}",
+             p->pid, idx, (unsigned long)g->d1, g->d2, g->d3,
+             g->d4[0], g->d4[1], g->d4[2], g->d4[3],
+             g->d4[4], g->d4[5], g->d4[6], g->d4[7]);
+    return buf;
+}
+
+static BOOL fake_write_pipe(int idx, UCHAR pipe, PUCHAR buf, ULONG len,
+                            PULONG xfer)
+{
+    if (is_verbose()) {
+        char hex[128] = {0};
+        ULONG i, off = 0;
+        for (i = 0; i < len && i < 32 && off < sizeof(hex) - 4; i++)
+            off += snprintf(hex + off, sizeof(hex) - off, "%02x ", buf ? buf[i] : 0);
+        dbg("TEST fake %d WritePipe pipe=0x%02x len=%u data=%s", idx, pipe, len, hex);
+    }
+    if ((pipe == 0x01 || pipe == 0x02) && buf && len >= 1 && buf[0] == 0x00)
+        fake_info_pending[idx & (FAKE_MAX - 1)] = 1;
+    if (xfer) *xfer = len;
+    return TRUE;
+}
+
+static BOOL fake_read_pipe(int idx, UCHAR pipe, PUCHAR buf, ULONG len,
+                           PULONG xfer)
+{
+    idx &= (FAKE_MAX - 1);
+    if (!buf || len == 0) {
+        if (xfer) *xfer = 0;
+        return TRUE;
+    }
+    if ((pipe == 0x81 || pipe == 0x82) && fake_info_pending[idx]) {
+        /* Same 41-byte GET_INFO layout the real TL866II+ returns; only the
+         * two per-device identity fields are replaced.  The trailing 9 bytes
+         * are the firmware/model capability block, not per-unit data. */
+        static const uint8_t template_info[41] = {
+            0x00, 0x01, 0x21, 0x00, 0x84, 0x02, 0x05, 0x00,
+            '2', '0', '7', '7', '0', '0', '6', '4',
+            'R', 'J', 'X', 'F', 'K', 'E', 'X', 'Y',
+            'K', '6', 'I', 'I', '7', 'R', '5', 'R',
+            0x37, 0x43, 0x4f, 0x41, 0xd0, 0x9e, 0x26, 0x84, 0x04
+        };
+        uint8_t info[41];
+        char num[9], ser[17];
+        ULONG n;
+        memcpy(info, template_info, sizeof(info));
+        fake_info_pending[idx] = 0;
+        snprintf(num, sizeof(num), "%08d", 90000000 + idx);
+        snprintf(ser, sizeof(ser), "FAKE%012d", idx);
+        memcpy(&info[8], num, 8);
+        memcpy(&info[16], ser, 16);
+        n = len < sizeof(info) ? len : sizeof(info);
+        memcpy(buf, info, n);
+        if (is_verbose()) {
+            char hex[128] = {0};
+            ULONG i, off = 0;
+            for (i = 0; i < n && i < 32 && off < sizeof(hex) - 4; i++)
+                off += snprintf(hex + off, sizeof(hex) - off, "%02x ", info[i]);
+            dbg("TEST fake %d ReadPipe pipe=0x%02x info %s", idx, pipe, hex);
+        }
+        if (xfer) *xfer = n;
+        return TRUE;
+    }
+    ULONG n = len > 64 ? 64 : len;
+    memset(buf, 0, n);
+    if (is_verbose()) dbg("TEST fake %d ReadPipe pipe=0x%02x len=%u -> zeros",
+                          idx, pipe, len);
+    if (xfer) *xfer = n;
+    return TRUE;
 }
 
 static SOCKET bridge_sock = INVALID_SOCKET;
@@ -256,13 +381,17 @@ static BOOL WINAPI my_SetupDiEnumDeviceInterfaces(
     const GUID *InterfaceClassGuid, DWORD MemberIndex,
     MY_SP_DEVICE_INTERFACE_DATA *DeviceInterfaceData)
 {
-    if (DeviceInfoSet == FAKE_HDEVINFO && MemberIndex == 0) {
-        dbg("SetupDiEnumDeviceInterfaces: returning %s at index 0", current_profile()->name);
+    if (DeviceInfoSet == FAKE_HDEVINFO &&
+        MemberIndex < (DWORD)fake_total()) {
+        dbg("SetupDiEnumDeviceInterfaces: returning %s at index %lu",
+            MemberIndex == 0 ? current_profile()->name : "FAKE",
+            (unsigned long)MemberIndex);
         if (DeviceInterfaceData) {
             DeviceInterfaceData->cbSize = sizeof(MY_SP_DEVICE_INTERFACE_DATA);
-            memcpy(&DeviceInterfaceData->InterfaceClassGuid, &current_profile()->guid, sizeof(xgpro_guid_t));
+            memcpy(&DeviceInterfaceData->InterfaceClassGuid,
+                   &current_profile()->guid, sizeof(xgpro_guid_t));
             DeviceInterfaceData->Flags = 1;
-            DeviceInterfaceData->Reserved = 0;
+            DeviceInterfaceData->Reserved = MemberIndex;
         }
         return TRUE;
     }
@@ -278,7 +407,10 @@ static BOOL WINAPI my_SetupDiGetDeviceInterfaceDetailA(
     MY_SP_DEVICE_INTERFACE_DETAIL_DATA_A *DetailData, DWORD DetailDataSize,
     DWORD *RequiredSize, void *DeviceInfoData)
 {
-    DWORD needed = offsetof(MY_SP_DEVICE_INTERFACE_DETAIL_DATA_A, DevicePath) + strlen(device_path()) + 1;
+    DWORD idx = InterfaceData ? (DWORD)InterfaceData->Reserved : 0;
+    const char *path = (idx == 0) ? device_path() : fake_device_path((int)idx);
+    DWORD needed = offsetof(MY_SP_DEVICE_INTERFACE_DETAIL_DATA_A, DevicePath) +
+                   strlen(path) + 1;
     dbg("SetupDiGetDeviceInterfaceDetailA: needed=%u provided=%u", needed, DetailDataSize);
 
     if (RequiredSize) *RequiredSize = needed;
@@ -289,7 +421,7 @@ static BOOL WINAPI my_SetupDiGetDeviceInterfaceDetailA(
     }
 
     DetailData->cbSize = 5;
-    strncpy(DetailData->DevicePath, device_path(), sizeof(DetailData->DevicePath) - 1);
+    strncpy(DetailData->DevicePath, path, sizeof(DetailData->DevicePath) - 1);
     DetailData->DevicePath[sizeof(DetailData->DevicePath) - 1] = '\0';
     dbg("  -> path: %s", DetailData->DevicePath);
     return TRUE;
@@ -314,6 +446,14 @@ static HANDLE WINAPI my_CreateFileA(
         upper[sizeof(upper) - 1] = '\0';
         _strupr(upper);
         if (strstr(upper, "VID_A466")) {
+            const char *f = strstr(upper, "FAKE");
+            if (f) {
+                int idx = atoi(f + 4);
+                if (idx >= 0 && idx < FAKE_MAX) {
+                    dbg("CreateFileA: TEST fake device %d", idx);
+                    return fake_handle(idx);
+                }
+            }
             dbg("CreateFileA: intercepted XGecu device open -> fake handle");
             return FAKE_FILE_HANDLE;
         }
@@ -347,6 +487,14 @@ static HANDLE WINAPI my_CreateFileW(
         if (n > 0) {
             _strupr(ansi);
             if (strstr(ansi, "VID_A466")) {
+                const char *f = strstr(ansi, "FAKE");
+                if (f) {
+                    int idx = atoi(f + 4);
+                    if (idx >= 0 && idx < FAKE_MAX) {
+                        dbg("CreateFileW: TEST fake device %d", idx);
+                        return fake_handle(idx);
+                    }
+                }
                 dbg("CreateFileW: intercepted XGecu device open -> fake handle");
                 return FAKE_FILE_HANDLE;
             }
@@ -462,6 +610,72 @@ static void patch_iat_entry(HMODULE module, const char *target_dll,
 }
 
 typedef HDEVNOTIFY (WINAPI *pfn_RegDevNotifA)(HANDLE, LPVOID, DWORD);
+/* TEST-ONLY UI probe (XGPRO_DUMP_UI): dumps the app's own status bar and
+ * list counts from inside the process, so the multi-device table can be
+ * verified without a screenshot.  Off by default. */
+#define SB_GETTEXT_A_MSG   (WM_USER + 2)
+#define SB_GETPARTS_MSG    (WM_USER + 6)
+#define LVM_GETITEMCOUNT_MSG 0x1004
+#define TB_GETBUTTONTEXT_A_MSG (WM_USER + 75)
+
+static LONG ui_dump_started = 0;
+
+static BOOL CALLBACK ui_top_cb(HWND h, LPARAM l)
+{
+    char txt[256] = {0};
+    GetWindowTextA(h, txt, sizeof(txt));
+    if (strstr(txt, "Xgpro")) {
+        *(HWND *)l = h;
+        return FALSE;
+    }
+    return TRUE;
+}
+
+static BOOL CALLBACK ui_child_cb(HWND h, LPARAM l)
+{
+    char cls[128] = {0}, txt[512] = {0};
+    GetClassNameA(h, cls, sizeof(cls));
+    GetWindowTextA(h, txt, sizeof(txt));
+    if (!strcmp(cls, "msctls_statusbar32")) {
+        int parts = (int)SendMessageA(h, SB_GETPARTS_MSG, 0, 0);
+        dbg("UI DUMP: status bar parts=%d", parts);
+        for (int i = 0; i < parts; i++) {
+            char b[512] = {0};
+            SendMessageA(h, SB_GETTEXT_A_MSG, (WPARAM)i, (LPARAM)b);
+            dbg("UI DUMP: status[%d]=\"%s\"", i, b);
+        }
+    } else if (!strcmp(cls, "Static")) {
+        if (strstr(txt, "rogrammer"))
+            dbg("UI DUMP: static=\"%s\"", txt);
+    } else if (!strcmp(cls, "SysListView32")) {
+        dbg("UI DUMP: list \"%s\" count=%ld", txt,
+            (long)SendMessageA(h, LVM_GETITEMCOUNT_MSG, 0, 0));
+    } else if (!strcmp(cls, "ToolbarWindow32")) {
+        for (int id = 1; id < 200; id++) {
+            char b[256] = {0};
+            if (SendMessageA(h, TB_GETBUTTONTEXT_A_MSG, (WPARAM)id,
+                             (LPARAM)b) > 0)
+                dbg("UI DUMP: toolbar id=%d text=\"%s\"", id, b);
+        }
+    }
+    return TRUE;
+}
+
+static DWORD WINAPI ui_dump_thread(LPVOID p)
+{
+    (void)p;
+    Sleep(8000);
+    HWND top = NULL;
+    EnumWindows(ui_top_cb, (LPARAM)&top);
+    if (!top) {
+        dbg("UI DUMP: Xgpro window not found");
+        return 0;
+    }
+    dbg("UI DUMP: top=%p", (void *)top);
+    EnumChildWindows(top, ui_child_cb, 0);
+    return 0;
+}
+
 static pfn_RegDevNotifA orig_RegisterDeviceNotificationA = NULL;
 static DWORD WINAPI subscriber_thread(LPVOID unused);
 
@@ -486,6 +700,11 @@ static HDEVNOTIFY WINAPI my_RegisterDeviceNotificationA(
     if (InterlockedExchange(&sub_started, 1) == 0) {
         CloseHandle(CreateThread(NULL, 0, subscriber_thread, NULL, 0, NULL));
         dbg("started hotplug subscriber");
+    }
+    if (getenv("XGPRO_DUMP_UI") &&
+        InterlockedExchange(&ui_dump_started, 1) == 0) {
+        CloseHandle(CreateThread(NULL, 0, ui_dump_thread, NULL, 0, NULL));
+        dbg("started UI dump");
     }
     return (HDEVNOTIFY)(ULONG_PTR)0xDB000001;
 }
@@ -617,6 +836,15 @@ __declspec(dllexport) BOOL __stdcall WinUsb_Initialize(
 {
     dbg("WinUsb_Initialize");
 
+    {
+        int fi = fake_index_from_handle(DeviceHandle);
+        if (fi >= 0) {
+            dbg("  -> TEST fake device %d", fi);
+            if (InterfaceHandle) *InterfaceHandle = DeviceHandle;
+            return TRUE;
+        }
+    }
+
     EnterCriticalSection(&bridge_cs);
     if (bridge_connect() < 0) {
         dbg("  -> failed to connect to bridge");
@@ -648,6 +876,8 @@ __declspec(dllexport) BOOL __stdcall WinUsb_Initialize(
 
 __declspec(dllexport) BOOL __stdcall WinUsb_Free(void *InterfaceHandle) {
     dbg("WinUsb_Free");
+    if (fake_index_from_handle((HANDLE)InterfaceHandle) >= 0)
+        return TRUE;
     EnterCriticalSection(&bridge_cs);
     if (bridge_sock != INVALID_SOCKET) {
         bridge_request_t req = { CMD_CLOSE, 0, 0 };
@@ -766,6 +996,14 @@ static BOOL read_pipe(UCHAR PipeID, PUCHAR Buffer, ULONG BufferLength, PULONG Le
         }
     }
 
+    if (is_verbose() && resp.length > 0 && Buffer) {
+        char hex[256] = {0};
+        ULONG i, off = 0;
+        for (i = 0; i < resp.length && i < 64 && off < sizeof(hex) - 4; i++)
+            off += snprintf(hex + off, sizeof(hex) - off, "%02x ", Buffer[i]);
+        dbg("WinUsb_ReadPipe pipe=0x%02x got=%u data=%s", PipeID, resp.length, hex);
+    }
+
     if (total_from_daemon > resp.length) {
         uint32_t remain = total_from_daemon - resp.length;
         char discard[4096];
@@ -790,7 +1028,10 @@ __declspec(dllexport) BOOL __stdcall WinUsb_WritePipe(
     void *InterfaceHandle, UCHAR PipeID,
     PUCHAR Buffer, ULONG BufferLength, PULONG LengthTransferred, void *Overlapped)
 {
-    BOOL ok = write_pipe(PipeID, Buffer, BufferLength, LengthTransferred);
+    int fi = fake_index_from_handle((HANDLE)InterfaceHandle);
+    BOOL ok = (fi >= 0) ?
+        fake_write_pipe(fi, PipeID, Buffer, BufferLength, LengthTransferred) :
+        write_pipe(PipeID, Buffer, BufferLength, LengthTransferred);
     complete_overlapped(Overlapped, ok, (ok && LengthTransferred) ? *LengthTransferred : 0);
     return ok;
 }
@@ -799,7 +1040,10 @@ __declspec(dllexport) BOOL __stdcall WinUsb_ReadPipe(
     void *InterfaceHandle, UCHAR PipeID,
     PUCHAR Buffer, ULONG BufferLength, PULONG LengthTransferred, void *Overlapped)
 {
-    BOOL ok = read_pipe(PipeID, Buffer, BufferLength, LengthTransferred);
+    int fi = fake_index_from_handle((HANDLE)InterfaceHandle);
+    BOOL ok = (fi >= 0) ?
+        fake_read_pipe(fi, PipeID, Buffer, BufferLength, LengthTransferred) :
+        read_pipe(PipeID, Buffer, BufferLength, LengthTransferred);
     complete_overlapped(Overlapped, ok, (ok && LengthTransferred) ? *LengthTransferred : 0);
     return ok;
 }
@@ -807,6 +1051,8 @@ __declspec(dllexport) BOOL __stdcall WinUsb_ReadPipe(
 __declspec(dllexport) BOOL __stdcall WinUsb_SetPipePolicy(
     void *InterfaceHandle, UCHAR PipeID, ULONG PolicyType, ULONG ValueLength, void *Value)
 {
+    if (fake_index_from_handle((HANDLE)InterfaceHandle) >= 0)
+        return TRUE;
     if (is_verbose())
         dbg("WinUsb_SetPipePolicy pipe=0x%02x policy=%u", PipeID, PolicyType);
 
@@ -832,6 +1078,8 @@ __declspec(dllexport) BOOL __stdcall WinUsb_SetPipePolicy(
 }
 
 __declspec(dllexport) BOOL __stdcall WinUsb_FlushPipe(void *InterfaceHandle, UCHAR PipeID) {
+    if (fake_index_from_handle((HANDLE)InterfaceHandle) >= 0)
+        return TRUE;
     if (is_verbose())
         dbg("WinUsb_FlushPipe 0x%02x", PipeID);
 
@@ -849,6 +1097,8 @@ __declspec(dllexport) BOOL __stdcall WinUsb_FlushPipe(void *InterfaceHandle, UCH
 }
 
 __declspec(dllexport) BOOL __stdcall WinUsb_AbortPipe(void *InterfaceHandle, UCHAR PipeID) {
+    if (fake_index_from_handle((HANDLE)InterfaceHandle) >= 0)
+        return TRUE;
     if (is_verbose())
         dbg("WinUsb_AbortPipe 0x%02x", PipeID);
 
